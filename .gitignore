@@ -1,2 +1,5 @@
 /data/1.mp4
 /题目.txt
+/output/
+__pycache__/
+*.pyc
