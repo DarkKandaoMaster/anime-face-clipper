@@ -1,1 +1,8 @@
-onnxruntime-gpu==1.18.1 --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/
+# GPU 版依赖。onnxruntime-gpu 的 CUDA 11 构建在专用源上，
+# 用 --extra-index-url 追加（不要用 --index-url，否则装不到 opencv / imgutils）。
+# 完整环境说明见 SETUP.md。
+--extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/
+
+onnxruntime-gpu==1.18.1   # CUDA 11.8 + cuDNN 8.x 构建；cuDNN 9 会报 error 126
+dghs-imgutils             # 动漫脸检测 (YOLOv8)
+opencv-python             # 抽帧后处理 / 模糊度 (Laplacian) 计算
