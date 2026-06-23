@@ -1,8 +1,7 @@
-"""Central configuration for the anime face clipper pipeline.
+"""动漫脸剪辑流程的集中配置。
 
-All tunable parameters live in a single :class:`Config` dataclass so that
-calibration for different art styles only requires editing one place (or
-overriding fields from the CLI). Nothing here performs I/O.
+所有可调参数都放在单个 :class:`Config` 数据类中，这样为不同画风校准时
+只需要改一个地方（或从命令行覆盖字段）。本文件不执行 I/O。
 """
 
 import dataclasses
@@ -10,50 +9,49 @@ import dataclasses
 
 @dataclasses.dataclass
 class Config:
-    """Tunable parameters for the whole pipeline.
+    """整个流程的可调参数。
 
-    Attributes are grouped by pipeline stage. Values flagged as empirical
-    (``blur_var_threshold``, ``scene_cut_threshold``) are expected to be
-    calibrated against the actual footage; the defaults are deliberately
-    conservative for a first pass.
+    属性按流程阶段分组。标记为经验值的参数
+    （``blur_var_threshold``、``scene_cut_threshold``）应结合实际素材校准；
+    默认值有意设得偏保守，适合作为首次处理的起点。
     """
 
     # === 抽帧 / 镜头切换 ===
-    # Seconds between sampled frames (ffmpeg fps = 1 / frame_interval).
+    # 采样帧之间的秒数（ffmpeg fps = 1 / frame_interval）。
     frame_interval: float = 0.3
-    # HSV histogram correlation below this between adjacent sampled frames is
-    # treated as a shot cut. Lower => fewer cuts detected. Calibrate per style.
+    # 相邻采样帧的 HSV 直方图相关性低于该值时视为镜头切换。
+    # 值越低，检测到的切换越少。应按画风校准。
     scene_cut_threshold: float = 0.6
 
     # === 检测 ===
-    # Registered detector name (see detectors.py).
+    # 已注册的检测器名称（见 detectors.py）。
     detector: str = "anime_face_imgutils"
-    # imgutils YOLOv8 model selection: level 's' (accurate) or 'n' (fast).
+    # imgutils YOLOv8 模型选择：level 's'（准确）或 'n'（快速）。
     detector_level: str = "s"
     detector_version: str = "v1.4"
-    # Detections below this confidence are dropped at the detector itself.
+    # 置信度低于该值的检测结果会在检测器内部被丢弃。
     conf_threshold: float = 0.5
 
     # === 过滤（三重质量过滤）===
-    # Minimum face-box height as a fraction of frame height (drops far/tiny faces).
+    # 人脸框高度占画面高度的最小比例（用于丢弃远处或过小的人脸）。
     min_face_height_ratio: float = 0.045
-    # Minimum Laplacian variance of the face crop (drops blurry/motion-smeared
-    # faces). Empirical; start conservative (low) and raise after inspecting output.
+    # 人脸裁剪图的最小拉普拉斯方差（用于丢弃模糊或运动拖影的人脸）。
+    # 经验值；先用偏保守的低值，检查输出后再提高。
     blur_var_threshold: float = 50.0
 
     # === 跟踪（IoU + 镜头切换断轨）===
-    # Adjacent-frame IoU at/above this links detections into one track.
+    # 相邻帧 IoU 大于等于该值时，将检测结果连接为同一条轨迹。
     iou_threshold: float = 0.3
-    # Number of consecutive missed frames a track may survive before closing.
+    # 轨迹关闭前允许连续丢失的帧数。
     track_gap_tolerance: int = 1
 
     # === 选段（滑窗计数 + 贪心）===
     window_seconds: float = 15.0
-    # A window qualifies when it contains at least this many track starts.
+    # 窗口内至少包含这么多轨迹起点时，该窗口才合格。
     min_events_per_window: int = 13
 
     # === 截取 ===
-    # Preferred (GPU) encoder; falls back to encoder_fallback on failure.
+    # 首选（GPU）编码器；失败时回退到 encoder_fallback。
     encoder: str = "h264_nvenc"
     encoder_fallback: str = "libx264"
 

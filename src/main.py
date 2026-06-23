@@ -1,17 +1,16 @@
-"""Anime face clipper — end-to-end pipeline.
+"""动漫脸剪辑器的端到端流程。
 
-From an anime video, find and cut every "qualified" 15-second segment, where a
-segment qualifies when at least ``min_events_per_window`` distinct face-track
-*starts* fall inside it. A track is a chain of IoU-overlapping face boxes across
-adjacent frames; a shot cut forcibly breaks tracks so a different character
-appearing in the same spot counts as a new event.
+从动漫视频中找出并截取所有“合格”的 15 秒片段。当一个片段内至少包含
+``min_events_per_window`` 个不同人脸轨迹的“起点”时，该片段视为合格。
+一条轨迹由相邻帧中 IoU 重叠的人脸框串联而成；镜头切换会强制断开轨迹，
+这样同一位置出现的不同角色会被计为新事件。
 
-Run from the project root:
+从项目根目录运行：
 
-    python -m src.main                      # processes data/1.mp4 -> output/1/
-    python -m src.main data/1.mp4 --viz 8   # also dump annotated sample frames
+    python src/main.py                      # 处理 data/1.mp4 -> output/1/
+    python src/main.py data/1.mp4 --viz 8   # 同时导出带标注的示例帧
 
-Stages (organized by section comments below):
+阶段（按下方分节注释组织）：
     抽帧 -> 检测 -> 过滤 -> 跟踪 -> 选段 -> 截取
 """
 
@@ -33,25 +32,25 @@ import cv2
 from config import Config
 from detectors import Detection, Detector, get_detector
 
-# Re-export so callers can also do ``from src.main import Detection``. The class
-# is defined in detectors.py to keep the detector module free of cycles.
+# 重新导出，方便调用方使用 ``from src.main import Detection``。
+# 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
 __all__ = ["Detection", "Track", "process_video", "run_pipeline", "main"]
 
 
 @dataclasses.dataclass
 class Track:
-    """A single face-appearance event: a chain of detections over time.
+    """单次人脸出现事件：按时间串联的一组检测结果。
 
-    Attributes:
-        track_id: Unique id within one video.
-        label: Category inherited from the detections.
-        start_time: Timestamp of the first detection (used for window counting).
-        end_time: Timestamp of the last detection.
-        detections: The member detections in time order.
-        representative_frame: Frame index of the sharpest detection.
-        representative_time: Timestamp of that detection.
-        representative_bbox: Box of that detection (for re-fetching from video).
-        representative_crop: Path to the saved crop image (relative to output).
+    属性：
+        track_id: 单个视频内的唯一 id。
+        label: 从检测结果继承的类别。
+        start_time: 首次检测的时间戳（用于窗口计数）。
+        end_time: 最后一次检测的时间戳。
+        detections: 按时间顺序排列的成员检测结果。
+        representative_frame: 最清晰检测结果所在的帧索引。
+        representative_time: 该检测结果的时间戳。
+        representative_bbox: 该检测结果的框（用于从视频中重新定位）。
+        representative_crop: 保存的裁剪图路径（相对于输出目录）。
     """
 
     track_id: int
@@ -65,22 +64,22 @@ class Track:
     representative_crop: str = ""
 
 
-# Module-level guard so the active ONNX providers are reported only once.
+# 模块级保护，确保只报告一次当前使用的 ONNX providers。
 _providers_reported = False
 
 
 # === 抽帧 ===
 
 def extract_frames(config: Config, video_path: str, frames_dir: str) -> List[Tuple[int, float, str]]:
-    """Sample frames with ffmpeg at a fixed interval.
+    """使用 ffmpeg 按固定间隔采样帧。
 
-    Args:
-        config: Pipeline configuration.
-        video_path: Source video.
-        frames_dir: Existing directory to write JPEGs into.
+    参数：
+        config: 流程配置。
+        video_path: 源视频。
+        frames_dir: 已存在的目录，JPEG 会写入其中。
 
-    Returns:
-        A list of ``(frame_index, time_seconds, frame_path)`` in time order.
+    返回：
+        按时间顺序排列的 ``(frame_index, time_seconds, frame_path)`` 列表。
     """
     pattern = os.path.join(frames_dir, "%06d.jpg")
     cmd = [
@@ -103,7 +102,7 @@ def extract_frames(config: Config, video_path: str, frames_dir: str) -> List[Tup
 
 
 def compute_hsv_hist(image_bgr):
-    """Compute a normalized HSV (H, S) histogram for shot-cut comparison."""
+    """计算归一化 HSV（H、S）直方图，用于镜头切换比较。"""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
@@ -113,9 +112,9 @@ def compute_hsv_hist(image_bgr):
 # === 过滤 ===
 
 def laplacian_variance(image_bgr, bbox: Tuple[int, int, int, int]) -> float:
-    """Laplacian variance of a bbox crop (focus/blur measure).
+    """边界框裁剪图的拉普拉斯方差（聚焦/模糊度量）。
 
-    Returns ``0.0`` for empty/degenerate crops.
+    对空裁剪或退化裁剪返回 ``0.0``。
     """
     x1, y1, x2, y2 = bbox
     h, w = image_bgr.shape[:2]
@@ -129,7 +128,7 @@ def laplacian_variance(image_bgr, bbox: Tuple[int, int, int, int]) -> float:
 
 
 def passes_quality(detection: Detection, frame_height: int, config: Config) -> bool:
-    """Apply the three quality gates: confidence, face size, sharpness."""
+    """应用三道质量门槛：置信度、人脸大小、清晰度。"""
     if detection.confidence < config.conf_threshold:
         return False
     face_height = detection.bbox[3] - detection.bbox[1]
@@ -143,7 +142,7 @@ def passes_quality(detection: Detection, frame_height: int, config: Config) -> b
 # === 跟踪 ===
 
 def iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    """Intersection-over-union of two ``(x1, y1, x2, y2)`` boxes."""
+    """两个 ``(x1, y1, x2, y2)`` 框的交并比。"""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
@@ -159,7 +158,7 @@ def iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
 
 
 def _cut_between(is_cut: List[bool], last_index: int, current_index: int) -> bool:
-    """True if a shot cut occurs in frames (last_index, current_index]."""
+    """如果在帧区间 (last_index, current_index] 内发生镜头切换，则返回 True。"""
     return any(is_cut[last_index + 1:current_index + 1])
 
 
@@ -168,22 +167,21 @@ def track_faces(
     is_cut: List[bool],
     config: Config,
 ) -> List[Track]:
-    """Link per-frame detections into tracks with IoU and shot-cut breaking.
+    """使用 IoU 和镜头切换断轨，将逐帧检测结果连接为轨迹。
 
-    Adjacent detections with IoU >= ``iou_threshold`` and matching label join
-    the same track. Up to ``track_gap_tolerance`` missed frames are tolerated.
-    A shot cut between two frames forbids linking across it, even at high IoU
-    (gap-tolerant re-links may not span a cut either).
+    相邻检测结果在标签相同且 IoU >= ``iou_threshold`` 时会加入同一条轨迹。
+    最多允许丢失 ``track_gap_tolerance`` 帧。两帧之间如果发生镜头切换，
+    即使 IoU 很高也禁止跨越切换连接（带丢帧容忍的重连也不能跨越切换）。
 
-    Args:
-        frame_detections: Per-frame lists of *quality-passed* detections.
-        is_cut: Per-frame flags; ``is_cut[i]`` marks a cut between frame i-1, i.
-        config: Pipeline configuration.
+    参数：
+        frame_detections: 每帧中通过质量过滤的检测结果列表。
+        is_cut: 每帧标记；``is_cut[i]`` 表示第 i-1 帧和第 i 帧之间有切换。
+        config: 流程配置。
 
-    Returns:
-        All tracks, sorted by start time.
+    返回：
+        所有轨迹，按开始时间排序。
     """
-    active: List[Dict] = []  # each: {id, label, last_index, dets:[Detection]}
+    active: List[Dict] = []  # 每项：{id, label, last_index, dets:[Detection]}
     finalized: List[Track] = []
     next_id = 1
 
@@ -200,8 +198,7 @@ def track_faces(
         )
 
     for i, dets in enumerate(frame_detections):
-        # Drop tracks that can no longer be revived: gap exceeded, or a cut now
-        # sits between their last detection and the current frame.
+        # 丢弃无法再恢复的轨迹：丢帧超过容忍值，或其最后检测到当前帧之间已有切换。
         still_active = []
         for tr in active:
             gap = i - tr["last_index"] - 1
@@ -211,7 +208,7 @@ def track_faces(
                 still_active.append(tr)
         active = still_active
 
-        # Greedy IoU matching: best pairs first, each track/detection used once.
+        # 贪心 IoU 匹配：最佳配对优先，每条轨迹和每个检测结果只使用一次。
         pairs = []
         for ti, tr in enumerate(active):
             last_box = tr["dets"][-1].bbox
@@ -232,7 +229,7 @@ def track_faces(
             active[ti]["dets"].append(dets[di])
             active[ti]["last_index"] = i
 
-        # Unmatched detections start new tracks.
+        # 未匹配的检测结果会启动新轨迹。
         for di, det in enumerate(dets):
             if di in matched_dets:
                 continue
@@ -247,11 +244,10 @@ def track_faces(
 
 
 def assign_representatives(tracks: List[Track], frame_paths: Dict[int, str], crops_dir: str) -> None:
-    """Pick each track's sharpest detection and save its crop.
+    """为每条轨迹选择最清晰的检测结果，并保存其裁剪图。
 
-    The representative maximizes ``blur_var * confidence`` over the track's
-    detections. The crop is read back from the corresponding sampled frame and
-    written to ``crops_dir``; the track records the path and source location.
+    代表检测结果是在该轨迹内使 ``blur_var * confidence`` 最大的检测结果。
+    裁剪图会从对应采样帧中读回并写入 ``crops_dir``；轨迹会记录路径和源位置。
     """
     os.makedirs(crops_dir, exist_ok=True)
     for track in tracks:
@@ -287,16 +283,15 @@ def select_segments(
     duration: float,
     config: Config,
 ) -> Tuple[List[Dict], int]:
-    """Slide a window over track-start times and greedily pick segments.
+    """在轨迹起点时间上滑动窗口，并贪心选择片段。
 
-    Candidate window starts step by ``frame_interval``. A window ``[t, t+W)``
-    qualifies when it contains at least ``min_events_per_window`` track starts.
-    On a qualifying window the segment ``[t, t+W]`` is emitted and the next
-    candidate jumps to ``>= t+W`` so segments never overlap.
+    候选窗口起点按 ``frame_interval`` 步进。窗口 ``[t, t+W)`` 至少包含
+    ``min_events_per_window`` 个轨迹起点时视为合格。遇到合格窗口时输出
+    片段 ``[t, t+W]``，下一个候选窗口跳到 ``>= t+W``，从而保证片段不重叠。
 
-    Returns:
-        A tuple ``(segments, num_qualified_windows)`` where each segment is a
-        dict with ``start``, ``end``, ``event_count`` and ``track_ids``.
+    返回：
+        元组 ``(segments, num_qualified_windows)``，其中每个片段都是包含
+        ``start``、``end``、``event_count`` 和 ``track_ids`` 的字典。
     """
     starts = sorted(t.start_time for t in tracks)
     window = config.window_seconds
@@ -334,7 +329,7 @@ def select_segments(
 # === 截取 ===
 
 def _encode_clip(config: Config, video_path: str, start: float, out_path: str, encoder: str) -> bool:
-    """Cut one re-encoded, frame-accurate clip with the given encoder."""
+    """使用指定编码器截取一个重新编码且帧精确的片段。"""
     cmd = [
         config.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.3f}",
@@ -352,7 +347,7 @@ def _encode_clip(config: Config, video_path: str, start: float, out_path: str, e
 
 
 def clip_segments(config: Config, video_path: str, segments: List[Dict], clips_dir: str) -> List[str]:
-    """Cut all selected segments, preferring GPU encoder with CPU fallback."""
+    """截取所有选中的片段，优先使用 GPU 编码器，失败时回退到 CPU。"""
     os.makedirs(clips_dir, exist_ok=True)
     encoder = config.encoder
     out_paths = []
@@ -373,7 +368,7 @@ def clip_segments(config: Config, video_path: str, segments: List[Dict], clips_d
 # === 工具 ===
 
 def probe_duration(config: Config, video_path: str) -> float:
-    """Return the video duration in seconds via ffprobe."""
+    """通过 ffprobe 返回视频时长（秒）。"""
     cmd = [
         config.ffprobe, "-v", "error",
         "-show_entries", "format=duration",
@@ -416,7 +411,7 @@ def _track_record(track: Track) -> Dict:
 
 
 def _report_providers(detector: Detector) -> None:
-    """Print ONNX providers once, to confirm GPU usage (verification step 1)."""
+    """只打印一次 ONNX providers，用于确认 GPU 使用情况（验证步骤 1）。"""
     global _providers_reported
     if _providers_reported:
         return
@@ -433,7 +428,7 @@ def _report_providers(detector: Detector) -> None:
 
 
 def _save_visualization(viz_dir: str, frame_path: str, detections: List[Detection]) -> None:
-    """Draw boxes + scores on a frame and save it (verification step 2)."""
+    """在帧上绘制框和分数并保存（验证步骤 2）。"""
     image = cv2.imread(frame_path)
     if image is None:
         return
@@ -459,21 +454,20 @@ def process_video(
     viz_count: int = 0,
     keep_frames: bool = False,
 ) -> Dict:
-    """Run the full pipeline for one video.
+    """对单个视频运行完整流程。
 
-    Args:
-        config: Pipeline configuration.
-        video_path: Source video path.
-        output_root: Base output directory; results go under ``<root>/<stem>/``.
-        detector: A shared detector instance (created if ``None``). Passing one
-            in lets a batch reuse a single loaded model.
-        limit_seconds: If set, only process frames before this timestamp (quick
-            calibration runs).
-        viz_count: Number of random annotated sample frames to dump.
-        keep_frames: Keep the temporary extracted frames instead of deleting.
+    参数：
+        config: 流程配置。
+        video_path: 源视频路径。
+        output_root: 基础输出目录；结果会写入 ``<root>/<stem>/``。
+        detector: 共享检测器实例（为 ``None`` 时创建）。传入该实例可让批处理复用
+            同一个已加载模型。
+        limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
+        viz_count: 随机导出的标注示例帧数量。
+        keep_frames: 保留临时抽取帧，而不是删除。
 
-    Returns:
-        A summary dict (also persisted across the JSON files).
+    返回：
+        摘要字典（也会持久化到 JSON 文件中）。
     """
     if detector is None:
         detector = get_detector(config.detector, config)
@@ -506,7 +500,7 @@ def process_video(
                 continue
             frame_h = image.shape[0]
 
-            # Shot-cut flag vs previous sampled frame.
+            # 与上一采样帧比较得到镜头切换标记。
             hist = compute_hsv_hist(image)
             if prev_hist is None:
                 is_cut.append(False)
@@ -515,7 +509,7 @@ def process_video(
                 is_cut.append(corr < config.scene_cut_threshold)
             prev_hist = hist
 
-            # Detect, then apply the three quality gates.
+            # 先检测，再应用三道质量门槛。
             raw = detector.detect(path, index, time)
             _report_providers(detector)
             kept = []
@@ -529,13 +523,13 @@ def process_video(
             if kept:
                 viz_candidates.append((path, kept))
 
-        # Tracking with shot-cut breaking.
+        # 带镜头切换断轨的跟踪。
         print(f"[{stem}] tracking...")
         tracks = track_faces(frame_detections, is_cut, config)
         crops_dir = os.path.join(out_dir, "crops")
         assign_representatives(tracks, frame_paths, crops_dir)
 
-        # Segment selection.
+        # 片段选择。
         duration = probe_duration(config, video_path)
         if limit_seconds is not None:
             duration = min(duration, limit_seconds)
@@ -545,18 +539,18 @@ def process_video(
             f"{len(segments)} segments selected"
         )
 
-        # Cut clips.
+        # 截取片段。
         clips_dir = os.path.join(out_dir, "clips")
         clip_paths = clip_segments(config, video_path, segments, clips_dir)
 
-        # Optional detection visualization.
+        # 可选的检测可视化。
         if viz_count > 0 and viz_candidates:
             viz_dir = os.path.join(out_dir, "viz")
             sample = random.sample(viz_candidates, min(viz_count, len(viz_candidates)))
             for path, dets in sample:
                 _save_visualization(viz_dir, path, dets)
 
-        # Persist outputs.
+        # 持久化输出。
         _write_json(os.path.join(out_dir, "detections.json"), detection_records)
         _write_json(
             os.path.join(out_dir, "tracks.json"),
@@ -599,10 +593,10 @@ def run_pipeline(
     output_root: str,
     **kwargs,
 ) -> List[Dict]:
-    """Process one or more videos, reusing a single loaded detector.
+    """处理一个或多个视频，并复用单个已加载的检测器。
 
-    Batch support is intentionally minimal in v1: the loop and shared detector
-    are here, the CLI just passes a single video.
+    v1 中的批处理支持有意保持最小化：这里保留循环和共享检测器，
+    CLI 只传入单个视频。
     """
     detector = get_detector(config.detector, config)
     summaries = []
@@ -620,7 +614,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Input video path(s). Default: data/1.mp4",
     )
     parser.add_argument("--output-dir", default="output", help="Output base directory.")
-    # Calibration-friendly overrides (verification steps 2/3).
+    # 便于校准的覆盖参数（验证步骤 2/3）。
     parser.add_argument("--conf", type=float, help="Override conf_threshold.")
     parser.add_argument("--blur-var", type=float, help="Override blur_var_threshold.")
     parser.add_argument("--scene-cut", type=float, help="Override scene_cut_threshold.")
@@ -634,7 +628,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entry point."""
+    """CLI 入口。"""
     args = _build_arg_parser().parse_args(argv)
 
     config = Config()
