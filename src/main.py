@@ -68,7 +68,7 @@ class Track:
 _providers_reported = False
 
 
-# === 抽帧 ===
+# === 1. 抽帧 ===
 
 def extract_frames(config: Config, video_path: str, frames_dir: str) -> List[Tuple[int, float, str]]:
     """使用 ffmpeg 按固定间隔采样帧。
@@ -109,7 +109,7 @@ def compute_hsv_hist(image_bgr):
     return hist
 
 
-# === 过滤 ===
+# === 3. 过滤 ===
 
 def laplacian_variance(image_bgr, bbox: Tuple[int, int, int, int]) -> float:
     """边界框裁剪图的拉普拉斯方差（聚焦/模糊度量）。
@@ -139,7 +139,7 @@ def passes_quality(detection: Detection, frame_height: int, config: Config) -> b
     return True
 
 
-# === 跟踪 ===
+# === 4. 跟踪 ===
 
 def iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
     """两个 ``(x1, y1, x2, y2)`` 框的交并比。"""
@@ -276,7 +276,7 @@ def assign_representatives(tracks: List[Track], frame_paths: Dict[int, str], cro
         track.representative_crop = os.path.join("crops", crop_name)
 
 
-# === 选段 ===
+# === 5. 选段 ===
 
 def select_segments(
     tracks: List[Track],
@@ -326,7 +326,7 @@ def select_segments(
     return segments, num_qualified
 
 
-# === 截取 ===
+# === 6. 截取 ===
 
 def _encode_clip(config: Config, video_path: str, start: float, out_path: str, encoder: str) -> bool:
     """使用指定编码器截取一个重新编码且帧精确的片段。"""
@@ -411,7 +411,7 @@ def _track_record(track: Track) -> Dict:
 
 
 def _report_providers(detector: Detector) -> None:
-    """只打印一次 ONNX providers，用于确认 GPU 使用情况（验证步骤 1）。"""
+    """只打印一次 ONNX providers，用于确认 GPU 使用情况。"""
     global _providers_reported
     if _providers_reported:
         return
@@ -428,7 +428,7 @@ def _report_providers(detector: Detector) -> None:
 
 
 def _save_visualization(viz_dir: str, frame_path: str, detections: List[Detection]) -> None:
-    """在帧上绘制框和分数并保存（验证步骤 2）。"""
+    """在帧上绘制框和分数并保存。"""
     image = cv2.imread(frame_path)
     if image is None:
         return
@@ -443,7 +443,7 @@ def _save_visualization(viz_dir: str, frame_path: str, detections: List[Detectio
     cv2.imwrite(os.path.join(viz_dir, os.path.basename(frame_path)), image)
 
 
-# === 编排 ===
+# === 核心编排 ===
 
 def process_video(
     config: Config,
@@ -491,6 +491,7 @@ def process_video(
         prev_hist = None
         viz_candidates: List[Tuple[str, List[Detection]]] = []
 
+        # 2. 检测 + 镜头切换标记
         for index, time, path in frames:
             frame_paths[index] = path
             image = cv2.imread(path)
@@ -609,21 +610,24 @@ def run_pipeline(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Anime face clipper.")
+    # 位置参数：输入视频，可传多个；不填则处理 data/1.mp4。例：python src/main.py a.mp4 b.mp4
     parser.add_argument(
         "videos", nargs="*", default=["data/1.mp4"],
         help="Input video path(s). Default: data/1.mp4",
     )
+    # 输出根目录，默认 output。
     parser.add_argument("--output-dir", default="output", help="Output base directory.")
-    # 便于校准的覆盖参数（验证步骤 2/3）。
-    parser.add_argument("--conf", type=float, help="Override conf_threshold.")
-    parser.add_argument("--blur-var", type=float, help="Override blur_var_threshold.")
-    parser.add_argument("--scene-cut", type=float, help="Override scene_cut_threshold.")
-    parser.add_argument("--min-events", type=int, help="Override min_events_per_window.")
-    parser.add_argument("--frame-interval", type=float, help="Override frame_interval.")
-    parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).")
-    parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.")
-    parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.")
-    parser.add_argument("--keep-frames", action="store_true", help="Keep temp frames.")
+    # 便于校准的覆盖参数：不填则用 config.py 中的默认值（见 main() 应用逻辑）。
+    parser.add_argument("--conf", type=float, help="Override conf_threshold.") # 置信度阈值（默认 0.5）。调高更严格：误检少、漏检多。
+    parser.add_argument("--blur-var", type=float, help="Override blur_var_threshold.") # 模糊过滤的拉普拉斯方差下限（默认 50.0）。调高丢弃更多模糊/拖影脸。
+    parser.add_argument("--scene-cut", type=float, help="Override scene_cut_threshold.") # 镜头切换阈值（默认 0.6）。调低则检测到的切换更少。
+    parser.add_argument("--min-events", type=int, help="Override min_events_per_window.") # 窗口内所需轨迹起点数（默认 13）。调低则更多片段合格、出片更多。
+    parser.add_argument("--frame-interval", type=float, help="Override frame_interval.") # 抽帧间隔秒数（默认 0.3）。调小则采样更密、更慢更准。
+    parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).") # 视频编码器（默认 h264_nvenc）。失败会自动回退到 libx264；无 GPU 时显式传 libx264。
+    # 运行 / 调试参数。
+    parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
+    parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.") # 导出 N 张带标注的样本帧，用于肉眼检查检测/过滤效果（默认 0，不导出）。
+    parser.add_argument("--keep-frames", action="store_true", help="Keep temp frames.") # 保留临时抽帧目录（默认清理），便于排查。
     return parser
 
 
