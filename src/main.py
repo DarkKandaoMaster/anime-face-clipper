@@ -285,9 +285,9 @@ def select_segments(
 ) -> Tuple[List[Dict], int]:
     """在轨迹起点时间上滑动窗口，并贪心选择片段。
 
-    候选窗口起点按 frame_interval 步进。窗口 [t, t+W) 至少包含
-    min_events_per_window 个轨迹起点时视为合格。遇到合格窗口时输出
-    片段 [t, t+W]，下一个候选窗口跳到 >= t+W，从而保证片段不重叠。
+    候选窗口起点按 frame_interval（抽帧间隔） 步进。窗口 [t, t+W) 至少包含
+    min_events_per_window 个轨迹起点时视为合格。遇到合格窗口时输出对应窗口，
+    下一个候选窗口跳到 >= t+W，从而保证片段不重叠。
 
     返回：
         元组 (segments, num_qualified_windows)，其中每个片段都是包含
@@ -304,9 +304,9 @@ def select_segments(
         t = k * step
         if t + window > duration + 1e-6:
             break
-        lo = bisect.bisect_left(starts, t)
-        hi = bisect.bisect_left(starts, t + window)
-        count = hi - lo
+        lo = bisect.bisect_left(starts, t) # 因为starts已排好序，所以二分查找出数组中第一个 starts>=t 的下标
+        hi = bisect.bisect_left(starts, t + window) # 二分查找出数组中第一个 starts>=t+window 的下标
+        count = hi - lo # 一减就得出了针对片段[t, t+W)，有多少个轨迹起点落在里面
         if count >= config.min_events_per_window:
             num_qualified += 1
             track_ids = [
@@ -320,7 +320,7 @@ def select_segments(
                     "track_ids": track_ids,
                 }
             )
-            k = math.ceil((t + window) / step - 1e-9)
+            k = math.ceil((t + window) / step - 1e-9) # math.ceil((t + window) / step)取最小的满足条件的整数，后面的 - 1e-9 是为了浮点防抖，防浮点误差
         else:
             k += 1
     return segments, num_qualified
