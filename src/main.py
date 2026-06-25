@@ -492,7 +492,7 @@ def process_video(
         viz_candidates: List[Tuple[str, List[Detection]]] = []
 
         # 2. 检测 + 镜头切换标记
-        for index, time, path in frames:
+        for index, time, path in frames: # 阶段1的extract_frames函数产出的数据结构是List[(frame_index, time_seconds, frame_path)]，和这里的index, time, path对应
             frame_paths[index] = path
             image = cv2.imread(path)
             if image is None:
