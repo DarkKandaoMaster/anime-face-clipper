@@ -229,7 +229,7 @@ def track_faces(
             active[ti]["dets"].append(dets[di])
             active[ti]["last_index"] = i
 
-        # 未匹配的检测结果会启动新轨迹。
+        # 未匹配任何轨迹的框，说明是一张新出现的脸，开一条新轨迹，分配next_id。
         for di, det in enumerate(dets):
             if di in matched_dets:
                 continue
