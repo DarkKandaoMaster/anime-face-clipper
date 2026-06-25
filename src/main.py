@@ -1,7 +1,7 @@
 """动漫脸剪辑器的端到端流程。
 
 从动漫视频中找出并截取所有“合格”的 15 秒片段。当一个片段内至少包含
-``min_events_per_window`` 个不同人脸轨迹的“起点”时，该片段视为合格。
+min_events_per_window 个不同人脸轨迹的“起点”时，该片段视为合格。
 一条轨迹由相邻帧中 IoU 重叠的人脸框串联而成；镜头切换会强制断开轨迹，
 这样同一位置出现的不同角色会被计为新事件。
 
@@ -32,7 +32,7 @@ import cv2
 from config import Config
 from detectors import Detection, Detector, get_detector
 
-# 重新导出，方便调用方使用 ``from src.main import Detection``。
+# 重新导出，方便调用方使用 from src.main import Detection。
 # 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
 __all__ = ["Detection", "Track", "process_video", "run_pipeline", "main"]
 
@@ -79,7 +79,7 @@ def extract_frames(config: Config, video_path: str, frames_dir: str) -> List[Tup
         frames_dir: 已存在的目录，JPEG 会写入其中。
 
     返回：
-        按时间顺序排列的 ``(frame_index, time_seconds, frame_path)`` 列表。
+        按时间顺序排列的 (frame_index, time_seconds, frame_path) 列表。
     """
     pattern = os.path.join(frames_dir, "%06d.jpg")
     cmd = [
@@ -114,17 +114,17 @@ def compute_hsv_hist(image_bgr):
 def laplacian_variance(image_bgr, bbox: Tuple[int, int, int, int]) -> float:
     """边界框裁剪图的拉普拉斯方差（聚焦/模糊度量）。
 
-    对空裁剪或退化裁剪返回 ``0.0``。
+    对空裁剪或退化裁剪返回 0.0。
     """
     x1, y1, x2, y2 = bbox
     h, w = image_bgr.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
+    x1, y1 = max(0, x1), max(0, y1) # 把框裁回画面边界内
     x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
+    if x2 <= x1 or y2 <= y1: # 空框/退化框
         return 0.0
-    crop = image_bgr[y1:y2, x1:x2]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    crop = image_bgr[y1:y2, x1:x2] # 只取人脸框那块，因为我们只关心脸糊不糊，而不是整帧。
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) # 格式转换。把彩色(3 通道 BGR)变成单通道灰度图。因为拉普拉斯算子是作用在单通道亮度上的,彩色三通道没必要分别算。
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var()) # 用拉普拉斯方差计算并返回清晰度。越清晰值越大
 
 
 def passes_quality(detection: Detection, frame_height: int, config: Config) -> bool:
@@ -142,7 +142,7 @@ def passes_quality(detection: Detection, frame_height: int, config: Config) -> b
 # === 4. 跟踪 ===
 
 def iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    """两个 ``(x1, y1, x2, y2)`` 框的交并比。"""
+    """两个框 (x1, y1, x2, y2) 的交并比。"""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
@@ -169,21 +169,21 @@ def track_faces(
 ) -> List[Track]:
     """使用 IoU 和镜头切换断轨，将逐帧检测结果连接为轨迹。
 
-    相邻检测结果在标签相同且 IoU >= ``iou_threshold`` 时会加入同一条轨迹。
-    最多允许丢失 ``track_gap_tolerance`` 帧。两帧之间如果发生镜头切换，
+    相邻检测结果在标签相同且 IoU >= iou_threshold 时会加入同一条轨迹。
+    最多允许丢失 track_gap_tolerance 帧。两帧之间如果发生镜头切换，
     即使 IoU 很高也禁止跨越切换连接（带丢帧容忍的重连也不能跨越切换）。
 
     参数：
         frame_detections: 每帧中通过质量过滤的检测结果列表。
-        is_cut: 每帧标记；``is_cut[i]`` 表示第 i-1 帧和第 i 帧之间有切换。
+        is_cut: 每帧标记；is_cut[i] 表示第 i-1 帧和第 i 帧之间有切换。
         config: 流程配置。
 
     返回：
         所有轨迹，按开始时间排序。
     """
-    active: List[Dict] = []  # 每项：{id, label, last_index, dets:[Detection]}
-    finalized: List[Track] = []
-    next_id = 1
+    active: List[Dict] = []  # 当前"还活着"、可能继续延伸的轨迹。每项：{id, label, last_index, dets:[Detection]}
+    finalized: List[Track] = [] # 已经封存、不再延伸的轨迹
+    next_id = 1 # 轨迹 id 自增计数器
 
     def _finalize(track: Dict) -> None:
         dets = track["dets"]
@@ -215,7 +215,7 @@ def track_faces(
             for di, det in enumerate(dets):
                 if det.label != tr["label"]:
                     continue
-                score = iou(last_box, det.bbox)
+                score = iou(last_box, det.bbox) # 计算两个框 (x1,y1,x2,y2) 的交并比
                 if score >= config.iou_threshold:
                     pairs.append((score, ti, di))
         pairs.sort(reverse=True)
@@ -246,8 +246,8 @@ def track_faces(
 def assign_representatives(tracks: List[Track], frame_paths: Dict[int, str], crops_dir: str) -> None:
     """为每条轨迹选择最清晰的检测结果，并保存其裁剪图。
 
-    代表检测结果是在该轨迹内使 ``blur_var * confidence`` 最大的检测结果。
-    裁剪图会从对应采样帧中读回并写入 ``crops_dir``；轨迹会记录路径和源位置。
+    代表检测结果是在该轨迹内使 blur_var * confidence 最大的检测结果。
+    裁剪图会从对应采样帧中读回并写入 crops_dir；轨迹会记录路径和源位置。
     """
     os.makedirs(crops_dir, exist_ok=True)
     for track in tracks:
@@ -285,13 +285,13 @@ def select_segments(
 ) -> Tuple[List[Dict], int]:
     """在轨迹起点时间上滑动窗口，并贪心选择片段。
 
-    候选窗口起点按 ``frame_interval`` 步进。窗口 ``[t, t+W)`` 至少包含
-    ``min_events_per_window`` 个轨迹起点时视为合格。遇到合格窗口时输出
-    片段 ``[t, t+W]``，下一个候选窗口跳到 ``>= t+W``，从而保证片段不重叠。
+    候选窗口起点按 frame_interval 步进。窗口 [t, t+W) 至少包含
+    min_events_per_window 个轨迹起点时视为合格。遇到合格窗口时输出
+    片段 [t, t+W]，下一个候选窗口跳到 >= t+W，从而保证片段不重叠。
 
     返回：
-        元组 ``(segments, num_qualified_windows)``，其中每个片段都是包含
-        ``start``、``end``、``event_count`` 和 ``track_ids`` 的字典。
+        元组 (segments, num_qualified_windows)，其中每个片段都是包含
+        start、end、event_count 和 track_ids 的字典。
     """
     starts = sorted(t.start_time for t in tracks)
     window = config.window_seconds
@@ -459,8 +459,8 @@ def process_video(
     参数：
         config: 流程配置。
         video_path: 源视频路径。
-        output_root: 基础输出目录；结果会写入 ``<root>/<stem>/``。
-        detector: 共享检测器实例（为 ``None`` 时创建）。传入该实例可让批处理复用
+        output_root: 基础输出目录；结果会写入 <root>/<stem>/。
+        detector: 共享检测器实例（为 None 时创建）。传入该实例可让批处理复用
             同一个已加载模型。
         limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
         viz_count: 随机导出的标注示例帧数量。
@@ -511,11 +511,11 @@ def process_video(
             prev_hist = hist # prev_hist 只保留最近一帧的直方图,下一轮被新的覆盖。所以任意时刻内存里最多只有 2 个直方图
 
             # 先检测，再应用三道质量门槛。
-            raw = detector.detect(path, index, time)
+            raw = detector.detect(path, index, time) # 阶段2拿到原始检测框
             _report_providers(detector)
             kept = []
             for det in raw:
-                det.blur_var = laplacian_variance(image, det.bbox)
+                det.blur_var = laplacian_variance(image, det.bbox) # 计算清晰度
                 ok = passes_quality(det, frame_h, config)
                 detection_records.append(_detection_record(det, ok))
                 if ok:
