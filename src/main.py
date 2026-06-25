@@ -102,7 +102,7 @@ def extract_frames(config: Config, video_path: str, frames_dir: str) -> List[Tup
 
 
 def compute_hsv_hist(image_bgr):
-    """计算归一化 HSV（H、S）直方图，用于镜头切换比较。"""
+    """计算归一化 HSV（H、S）直方图，把每帧压成一个颜色直方图，用于镜头切换比较。"""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
@@ -502,13 +502,13 @@ def process_video(
             frame_h = image.shape[0]
 
             # 与上一采样帧比较得到镜头切换标记。
-            hist = compute_hsv_hist(image)
+            hist = compute_hsv_hist(image) # 把每帧压成一个颜色直方图(一个 numpy 数组)
             if prev_hist is None:
                 is_cut.append(False)
             else:
                 corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
                 is_cut.append(corr < config.scene_cut_threshold)
-            prev_hist = hist
+            prev_hist = hist # prev_hist 只保留最近一帧的直方图,下一轮被新的覆盖。所以任意时刻内存里最多只有 2 个直方图
 
             # 先检测，再应用三道质量门槛。
             raw = detector.detect(path, index, time)
