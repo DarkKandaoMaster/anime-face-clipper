@@ -5,6 +5,7 @@
 """
 
 import dataclasses
+from typing import Optional
 
 
 @dataclasses.dataclass
@@ -45,9 +46,15 @@ class Config:
     # 轨迹关闭前允许连续丢失的帧数。
     track_gap_tolerance: int = 1
 
+    # === 角色识别（CCIP）===
+    # 两条轨迹代表裁剪图的 CCIP 差异低于该阈值时视为同一角色。
+    # None = 使用 imgutils 的 ccip_default_threshold()（约 0.178）。
+    # 调低更严格、更容易把同一角色拆成多个；调高更容易合并。
+    ccip_threshold: Optional[float] = 0.05
+
     # === 选段（滑窗计数 + 贪心）===
     window_seconds: float = 15.0
-    # 窗口内至少包含这么多轨迹起点时，该窗口才合格。
+    # 窗口内至少出现过这么多不同角色时，该窗口才合格。
     min_events_per_window: int = 13
 
     # === 截取 ===

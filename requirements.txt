@@ -2,3 +2,4 @@ onnxruntime-gpu==1.18.1 --index-url https://aiinfra.pkgs.visualstudio.com/Public
 # onnxruntime-gpu==1.18.1 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/ # 听说使用这句代码而不是上句代码安装时可以同时安装opencv/imgutils
 dghs-imgutils             # 动漫脸检测 (YOLOv8)
 opencv-python             # 抽帧后处理 / 模糊度 (Laplacian) 计算
+scipy                     # complete-linkage 层次聚类（角色识别）
