@@ -128,7 +128,7 @@ data/1.mp4
 给每条轨迹一个**角色身份**(`character_id`),让后续选段能按"不同角色"去重计数:
 
 - 对每条有代表裁剪图的轨迹,用 `imgutils.metrics` 的 **CCIP**(动漫角色相似度模型)提取 `crops/track_<id>.jpg` 的特征,再算两两差异矩阵。特征**分批提取**(每批 32 张),避免一次性送入几百张图导致 ONNX 推理内存分配失败。
-- 对差异矩阵做 **complete-linkage(全连接)层次聚类**(scipy `linkage` + `fcluster`):簇内**任意两张**裁剪图差异都 `< ccip_threshold`(默认 0.05)才允许同簇,同一簇 = 同一角色,簇编号即 `character_id`。**不做传递合并**——a~b 且 b~c 但 a、c 差异超阈值时,a、c 不会同簇(旧实现用并查集传递合并,差异链会把全片轨迹塌缩进一个簇,已弃用)。
+- 对差异矩阵做 **complete-linkage(全连接)层次聚类**(scipy `linkage` + `fcluster`):簇内**任意两张**裁剪图差异都 `< ccip_threshold`(0.05)才允许同簇,同一簇 = 同一角色,簇编号即 `character_id`。**不做传递合并**——a~b 且 b~c 但 a、c 差异超阈值时,a、c 不会同簇(旧实现用并查集传递合并,差异链会把全片轨迹塌缩进一个簇,已弃用)。
 - 没有代表裁剪图(或文件缺失)的轨迹保持 `character_id=None`,**不参与角色计数**(无法确认身份就不算一个角色)。
 - 首次运行会从 HuggingFace 下载 CCIP ONNX 模型(一次性)。
 
