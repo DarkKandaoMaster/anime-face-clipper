@@ -339,7 +339,6 @@ def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
         识别出的不同角色总数。
     """
     # 延迟导入：CCIP 模型较重且首次使用需从 HuggingFace 下载，
-    # 与 detectors.py 的延迟导入风格一致。
     from imgutils.metrics import (
         ccip_batch_differences,
         ccip_batch_extract_features,
