@@ -283,7 +283,7 @@ def assign_representatives(tracks: List[Track], frame_paths: Dict[int, str], cro
         track.representative_crop = os.path.join("crops", crop_name)
 
 
-# === 4.5 角色识别 ===
+# === 5. 角色识别 ===
 
 def _cluster_by_difference(diff_matrix, threshold: float) -> List[int]:
     """按 complete-linkage（全连接）层次聚类分簇。
@@ -377,7 +377,7 @@ def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
     return len(set(cluster_ids))
 
 
-# === 5. 选段 ===
+# === 6. 选段 ===
 
 def select_segments(
     tracks: List[Track],
@@ -431,7 +431,7 @@ def select_segments(
     return segments, num_qualified
 
 
-# === 6. 截取 ===
+# === 7. 截取 ===
 
 def _encode_clip(config: Config, video_path: str, start: float, out_path: str, encoder: str) -> bool:
     """使用指定编码器截取一个重新编码且帧精确的片段。"""
