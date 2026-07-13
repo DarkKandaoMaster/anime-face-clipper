@@ -132,7 +132,7 @@ data/1.mp4
 - 没有代表裁剪图(或文件缺失)的轨迹保持 `character_id=None`,**不参与角色计数**(无法确认身份就不算一个角色)。
 - 首次运行会从 HuggingFace 下载 CCIP ONNX 模型(一次性)。
 
-产出:每条轨迹带 `character_id` → 写入 `tracks.json`;日志打印识别出的角色总数。
+产出:每条轨迹带 `character_id` → 写入 `tracks.json`;日志打印识别出的角色总数。（154）
 
 ### 阶段 6:选段 — `select_segments`([main.py:383](./src/main.py#L383))
 
