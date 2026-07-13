@@ -550,7 +550,7 @@ def _save_visualization(viz_dir: str, frame_path: str, detections: List[Detectio
     cv2.imwrite(os.path.join(viz_dir, os.path.basename(frame_path)), image)
 
 
-# === 核心编排 ===
+# === 主流程 ===
 
 def process_video(
     config: Config,
