@@ -20,9 +20,8 @@ from config import Config
 class Detection:
     """单帧上的单个检测框。
 
-    这是检测器与流程其余部分之间的稳定契约。``blur_var`` 不由检测器设置；
-    它会在后续质量过滤阶段填充（裁剪图的拉普拉斯方差），并保存在检测结果上，
-    以便轨迹选择最清晰的代表结果。
+    这是检测器与流程其余部分之间的稳定契约。``blur_var`` 与 ``crop`` 都不由
+    检测器设置；它们会在后续质量过滤阶段填充，供跟踪阶段在线挑选代表裁剪图。
 
     属性：
         frame_index: 采样帧的从零开始索引。
@@ -31,6 +30,10 @@ class Detection:
         confidence: 检测器置信度，范围为 ``[0, 1]``。
         label: 检测类别（例如 ``"anime_face"``）。
         blur_var: 裁剪图的拉普拉斯方差；由过滤阶段填充。
+        crop: 该框对应的 BGR 裁剪图，由过滤阶段填充。流式处理中整帧读完即弃，
+            无法事后回查，因此裁剪图必须在当帧就地留下。跟踪器在把检测结果
+            并入轨迹时会挑出最优的一张留存、其余立即置 None 释放，
+            所以内存中最多只有"每条活跃轨迹一张脸"。不参与 JSON 序列化。
     """
 
     frame_index: int
@@ -39,6 +42,7 @@ class Detection:
     confidence: float
     label: str
     blur_var: Optional[float] = None
+    crop: Optional["object"] = None
 
 
 class Detector(abc.ABC):
@@ -48,13 +52,14 @@ class Detector(abc.ABC):
         self._config = config
 
     @abc.abstractmethod
-    def detect(self, image_path: str, frame_index: int, time: float) -> List[Detection]:
+    def detect(self, image, frame_index: int, time: float) -> List[Detection]:
         """在单帧上检测目标。
 
         参数：
-            image_path: 帧图片路径。实现应从该路径读取
-                （imgutils 的 ``load_image`` 会按 RGB 解码）；
-                这里有意不支持直接传入原始 NumPy 数组。
+            image: 已解码的帧，``PIL.Image.Image``（RGB）。流程是流式的，
+                帧不落盘，因此这里传的是内存中的图像对象而非路径。
+                ``PIL.Image.Image`` 是 imgutils 的 ``ImageTyping`` 成员，
+                可直接送入其模型；NumPy 数组不是，需调用方先行转换。
             frame_index: 帧的从零开始索引。
             time: 帧时间戳（秒）。
 
@@ -119,9 +124,9 @@ class AnimeFaceImgutils(Detector):
 
         self._detect_faces = detect_faces
 
-    def detect(self, image_path: str, frame_index: int, time: float) -> List[Detection]:
+    def detect(self, image, frame_index: int, time: float) -> List[Detection]:
         results = self._detect_faces(
-            image_path,
+            image,
             level=self._config.detector_level,
             version=self._config.detector_version,
             conf_threshold=self._config.conf_threshold,

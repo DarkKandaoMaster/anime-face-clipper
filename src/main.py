@@ -6,13 +6,23 @@
 对各轨迹的代表裁剪图聚类，得到轨迹级角色身份（character_id），同一角色的
 多条轨迹在窗口内只计一次。
 
+流式处理：帧由 cv2.VideoCapture 顺序解码，用完即弃，全程不落盘。整条流水线
+在内存中同时持有的图像只有“当前帧 + 每条活跃轨迹一张人脸裁剪图”，与视频
+长度无关。代表裁剪图必须在检测的当帧就地留下——流式下没有第二次机会回头
+读取任意一帧。
+
 从项目根目录运行：
 
     python src/main.py                      # 处理 data/1.mp4 -> output/1/
     python src/main.py data/1.mp4 --viz 8   # 同时导出带标注的示例帧
 
 阶段（按下方分节注释组织）：
-    抽帧 -> 检测 -> 过滤 -> 跟踪 -> 角色识别 -> 选段 -> 截取
+    解码抽帧 -> 检测 -> 过滤 -> 跟踪 -> 角色识别 -> 选段 -> 截取
+
+阈值敏感性：本流水线的输出对 ccip_threshold 与 min_events_per_window 高度
+敏感，两者会互相补偿（阈值调严 -> 同一角色被拆成多个 -> 角色数虚高 ->
+更容易越过 min_events 门槛）。在无逐窗口真值标注的情况下，单次运行的数字
+不构成对“真实角色数”的测量。定参数前请先用 sweep.py 扫一遍敏感性曲线。
 """
 
 import argparse
@@ -25,11 +35,11 @@ import random
 import shutil
 import subprocess
 import sys
-import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
@@ -53,7 +63,8 @@ class Track:
         detections: 按时间顺序排列的成员检测结果。
         representative_frame: 最清晰检测结果所在的帧索引。
         representative_time: 该检测结果的时间戳。
-        representative_bbox: 该检测结果的框（用于从视频中重新定位）。
+        representative_bbox: 该检测结果的框（仅作溯源记录）。
+        representative_image: 跟踪时在线留存的 BGR 裁剪图；写盘后置 None。
         representative_crop: 保存的裁剪图路径（相对于输出目录）。
         character_id: CCIP 聚类得到的角色簇编号；None 表示身份未知
             （无代表裁剪图或读取失败），不参与窗口内的角色计数。
@@ -67,6 +78,7 @@ class Track:
     representative_frame: int = -1
     representative_time: float = 0.0
     representative_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    representative_image: Optional[np.ndarray] = None
     representative_crop: str = ""
     character_id: Optional[int] = None
 
@@ -75,37 +87,79 @@ class Track:
 _providers_reported = False
 
 
-# === 1. 抽帧 ===
+# === 1. 解码抽帧 ===
 
-def extract_frames(config: Config, video_path: str, frames_dir: str) -> List[Tuple[int, float, str]]:
-    """使用 ffmpeg 按固定间隔采样帧。
+def iter_frames(
+    config: Config,
+    video_path: str,
+    limit_seconds: Optional[float] = None,
+) -> Iterator[Tuple[int, float, np.ndarray]]:
+    """顺序解码视频，按 frame_interval 采样，逐帧产出 BGR 图像。
+
+    用 grab()/retrieve() 而非 seek：长 GOP 的 H.264 上 seek 会被吸附到关键帧，
+    既不准也不快。grab() 跳过不需要的帧的色彩转换与内存拷贝，retrieve() 只在
+    命中采样点时才真正取出图像。
+
+    时间戳取 raw_index / fps 而非“采样序号 * 间隔”——后者在 fps 非整除时会
+    随视频长度线性漂移，直接污染窗口边界与最终切片位置。
 
     参数：
         config: 流程配置。
         video_path: 源视频。
-        frames_dir: 已存在的目录，JPEG 会写入其中。
+        limit_seconds: 若给定，到达该时间戳即停止解码（不是解码完再过滤）。
 
-    返回：
-        按时间顺序排列的 (frame_index, time_seconds, frame_path) 列表。
+    产出：
+        (sample_index, time_seconds, frame_bgr)，sample_index 从 0 连续递增。
     """
-    pattern = os.path.join(frames_dir, "%06d.jpg")
-    cmd = [
-        config.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-        "-i", video_path,
-        "-vf", f"fps=1/{config.frame_interval}",
-        "-q:v", "2",
-        pattern,
-    ]
-    subprocess.run(cmd, check=True)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频：{video_path}")
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or math.isnan(fps):
+            raise RuntimeError(f"视频未报告有效帧率（fps={fps!r}）：{video_path}")
 
-    files = sorted(
-        f for f in os.listdir(frames_dir) if f.lower().endswith(".jpg")
-    )
-    frames = []
-    for index, name in enumerate(files):
-        time = index * config.frame_interval
-        frames.append((index, time, os.path.join(frames_dir, name)))
-    return frames
+        sample_index = 0
+        raw_index = 0
+        next_sample_time = 0.0
+        while True:
+            if not cap.grab():
+                break
+            time = raw_index / fps
+            raw_index += 1
+            if time + 1e-9 < next_sample_time:
+                continue
+            if limit_seconds is not None and time >= limit_seconds:
+                break
+            ok, frame = cap.retrieve()
+            if not ok:
+                continue
+            next_sample_time += config.frame_interval
+            yield sample_index, time, frame
+            sample_index += 1
+    finally:
+        cap.release()
+
+
+def to_pil(image_bgr: np.ndarray) -> Image.Image:
+    """OpenCV 的 BGR 数组 -> PIL RGB 图像（imgutils 模型的输入类型）。"""
+    return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+
+
+def imwrite_unicode(path: str, image_bgr: np.ndarray) -> bool:
+    """写图片，兼容非 ASCII 路径。
+
+    cv2.imwrite 在 Windows 上把路径按本地 ANSI 代码页处理，遇到中文目录名会
+    静默返回 False 而不抛异常——中文片名的视频会导致所有裁剪图丢失、
+    所有轨迹的 character_id 变成 None、最终一个片段都选不出来。
+    绕开方式是自己编码后用 numpy.tofile 写（走 Python 的宽字符文件 API）。
+    """
+    ext = os.path.splitext(path)[1] or ".jpg"
+    ok, buf = cv2.imencode(ext, image_bgr)
+    if not ok:
+        return False
+    buf.tofile(path)
+    return True
 
 
 def compute_hsv_hist(image_bgr):
@@ -118,19 +172,30 @@ def compute_hsv_hist(image_bgr):
 
 # === 3. 过滤 ===
 
-def laplacian_variance(image_bgr, bbox: Tuple[int, int, int, int]) -> float:
-    """边界框裁剪图的拉普拉斯方差（聚焦/模糊度量）。
+def crop_bbox(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    """按框裁出子图（拷贝一份，使其不再持有整帧的内存）。
 
-    对空裁剪或退化裁剪返回 0.0。
+    框会先裁回画面边界内；空框/退化框返回 None。
     """
     x1, y1, x2, y2 = bbox
     h, w = image_bgr.shape[:2]
     x1, y1 = max(0, x1), max(0, y1) # 把框裁回画面边界内
     x2, y2 = min(w, x2), min(h, y2)
     if x2 <= x1 or y2 <= y1: # 空框/退化框
+        return None
+    # copy() 是关键：numpy 切片是原帧的视图，留着它等于留着整帧不放，
+    # 流式处理的内存优势会被这一个引用全部抵消。
+    return image_bgr[y1:y2, x1:x2].copy()
+
+
+def laplacian_variance(crop_bgr: Optional[np.ndarray]) -> float:
+    """裁剪图的拉普拉斯方差（聚焦/模糊度量）。
+
+    只取人脸框那块，因为我们只关心脸糊不糊，而不是整帧。空裁剪返回 0.0。
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
         return 0.0
-    crop = image_bgr[y1:y2, x1:x2] # 只取人脸框那块，因为我们只关心脸糊不糊，而不是整帧。
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) # 格式转换。把彩色(3 通道 BGR)变成单通道灰度图。因为拉普拉斯算子是作用在单通道亮度上的,彩色三通道没必要分别算。
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) # 格式转换。把彩色(3 通道 BGR)变成单通道灰度图。因为拉普拉斯算子是作用在单通道亮度上的,彩色三通道没必要分别算。
     return float(cv2.Laplacian(gray, cv2.CV_64F).var()) # 用拉普拉斯方差计算并返回清晰度。越清晰值越大
 
 
@@ -164,66 +229,99 @@ def iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _cut_between(is_cut: List[bool], last_index: int, current_index: int) -> bool:
-    """如果在帧区间 (last_index, current_index] 内发生镜头切换，则返回 True。"""
-    return any(is_cut[last_index + 1:current_index + 1])
-
-
-def track_faces(
-    frame_detections: List[List[Detection]],
-    is_cut: List[bool],
-    config: Config,
-) -> List[Track]:
-    """使用 IoU 和镜头切换断轨，将逐帧检测结果连接为轨迹。
+class FaceTracker:
+    """在线 IoU 跟踪器：逐帧喂入检测结果，封存轨迹时一并交出代表裁剪图。
 
     相邻检测结果在标签相同且 IoU >= iou_threshold 时会加入同一条轨迹。
     最多允许丢失 track_gap_tolerance 帧。两帧之间如果发生镜头切换，
     即使 IoU 很高也禁止跨越切换连接（带丢帧容忍的重连也不能跨越切换）。
 
-    参数：
-        frame_detections: 每帧中通过质量过滤的检测结果列表。
-        is_cut: 每帧标记；is_cut[i] 表示第 i-1 帧和第 i 帧之间有切换。
-        config: 流程配置。
-
-    返回：
-        所有轨迹，按开始时间排序。
+    之所以做成在线的：代表裁剪图要挑“该轨迹内 blur_var * confidence 最大”
+    的那一张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那一帧，
+    流式下帧已经丢了。于是改为边跟踪边擂台——每条活跃轨迹只留当前最优的一张
+    裁剪图，来了更好的就换掉，内存占用与视频长度无关。
     """
-    active: List[Dict] = []  # 当前"还活着"、可能继续延伸的轨迹。每项：{id, label, last_index, dets:[Detection]}
-    finalized: List[Track] = [] # 已经封存、不再延伸的轨迹
-    next_id = 1 # 轨迹 id 自增计数器
 
-    def _finalize(track: Dict) -> None:
+    def __init__(self, config: Config):
+        self._config = config
+        self._active: List[Dict] = []  # 当前"还活着"、可能继续延伸的轨迹
+        self._finalized: List[Track] = []  # 已经封存、不再延伸的轨迹
+        self._next_id = 1  # 轨迹 id 自增计数器
+
+    def _open(self, index: int, det: Detection) -> None:
+        """一张没能接上任何轨迹的脸，说明是新出现的，开一条新轨迹。"""
+        track = {
+            "id": self._next_id,
+            "label": det.label,
+            "last_index": index,
+            "dets": [det],
+            "blocked": False,
+            "best_score": -1.0,
+            "best_det": None,
+            "best_crop": None,
+        }
+        self._next_id += 1
+        self._active.append(track)
+        self._offer(track, det)
+
+    def _offer(self, track: Dict, det: Detection) -> None:
+        """让 det 参与该轨迹的代表擂台；无论胜负都释放 det 持有的裁剪图。"""
+        score = (det.blur_var or 0.0) * det.confidence
+        if score > track["best_score"]:
+            track["best_score"] = score
+            track["best_det"] = det
+            track["best_crop"] = det.crop
+        det.crop = None  # 落选的裁剪图到此为止，不随 dets 列表一路累积
+
+    def _finalize(self, track: Dict) -> None:
         dets = track["dets"]
-        finalized.append(
+        best = track["best_det"]
+        self._finalized.append(
             Track(
                 track_id=track["id"],
                 label=track["label"],
                 start_time=dets[0].time,
                 end_time=dets[-1].time,
                 detections=dets,
+                representative_frame=best.frame_index if best else -1,
+                representative_time=best.time if best else 0.0,
+                representative_bbox=best.bbox if best else (0, 0, 0, 0),
+                representative_image=track["best_crop"],
             )
         )
 
-    for i, dets in enumerate(frame_detections):
+    def update(self, index: int, cut: bool, detections: List[Detection]) -> None:
+        """处理第 index 帧。
+
+        参数：
+            index: 采样帧的从零开始索引。
+            cut: 第 index-1 帧与第 index 帧之间是否发生镜头切换。
+            detections: 该帧中通过质量过滤的检测结果。
+        """
+        # 切换发生在本帧之前，所有活跃轨迹（last_index 必 < index）都被它隔开。
+        if cut:
+            for tr in self._active:
+                tr["blocked"] = True
+
         # 丢弃无法再恢复的轨迹：丢帧超过容忍值，或其最后检测到当前帧之间已有切换。
         still_active = []
-        for tr in active:
-            gap = i - tr["last_index"] - 1
-            if gap > config.track_gap_tolerance or _cut_between(is_cut, tr["last_index"], i):
-                _finalize(tr)
+        for tr in self._active:
+            gap = index - tr["last_index"] - 1
+            if gap > self._config.track_gap_tolerance or tr["blocked"]:
+                self._finalize(tr)
             else:
                 still_active.append(tr)
-        active = still_active
+        self._active = still_active
 
         # 贪心 IoU 匹配：最佳配对优先，每条轨迹和每个检测结果只使用一次。
         pairs = []
-        for ti, tr in enumerate(active):
+        for ti, tr in enumerate(self._active):
             last_box = tr["dets"][-1].bbox
-            for di, det in enumerate(dets):
+            for di, det in enumerate(detections):
                 if det.label != tr["label"]:
                     continue
                 score = iou(last_box, det.bbox) # 计算两个框 (x1,y1,x2,y2) 的交并比
-                if score >= config.iou_threshold:
+                if score >= self._config.iou_threshold:
                     pairs.append((score, ti, di))
         pairs.sort(reverse=True)
 
@@ -233,54 +331,65 @@ def track_faces(
                 continue
             matched_tracks.add(ti)
             matched_dets.add(di)
-            active[ti]["dets"].append(dets[di])
-            active[ti]["last_index"] = i
+            track = self._active[ti]
+            track["dets"].append(detections[di])
+            track["last_index"] = index
+            self._offer(track, detections[di])
 
-        # 未匹配任何轨迹的框，说明是一张新出现的脸，开一条新轨迹，分配next_id。
-        for di, det in enumerate(dets):
-            if di in matched_dets:
-                continue
-            active.append({"id": next_id, "label": det.label, "last_index": i, "dets": [det]})
-            next_id += 1
+        for di, det in enumerate(detections):
+            if di not in matched_dets:
+                self._open(index, det)
 
-    for tr in active:
-        _finalize(tr)
+    def finish(self) -> List[Track]:
+        """封存所有剩余轨迹，返回按开始时间排序的全部轨迹。"""
+        for tr in self._active:
+            self._finalize(tr)
+        self._active = []
+        self._finalized.sort(key=lambda t: t.start_time)
+        return self._finalized
 
-    finalized.sort(key=lambda t: t.start_time)
-    return finalized
 
+def track_faces(
+    frame_detections: List[List[Detection]],
+    is_cut: List[bool],
+    config: Config,
+) -> List[Track]:
+    """把逐帧检测结果一次性喂给 :class:`FaceTracker`（批处理入口）。
 
-def assign_representatives(tracks: List[Track], frame_paths: Dict[int, str], crops_dir: str) -> None:
-    """为每条轨迹选择最清晰的检测结果，并保存其裁剪图。
+    参数：
+        frame_detections: 每帧中通过质量过滤的检测结果列表。
+        is_cut: 每帧标记；is_cut[i] 表示第 i-1 帧和第 i 帧之间有切换。
+        config: 流程配置。
 
-    代表检测结果是在该轨迹内使 blur_var * confidence 最大的检测结果。
-    裁剪图会从对应采样帧中读回并写入 crops_dir；轨迹会记录路径和源位置。
+    返回：
+        所有轨迹，按开始时间排序。
     """
+    tracker = FaceTracker(config)
+    for i, dets in enumerate(frame_detections):
+        tracker.update(i, is_cut[i], dets)
+    return tracker.finish()
+
+
+def save_representatives(tracks: List[Track], crops_dir: str) -> None:
+    """把跟踪阶段在线留存的代表裁剪图写盘，并释放其内存。
+
+    裁剪图在跟踪时就已选定（见 :class:`FaceTracker`），这里只负责落盘：
+    写入 crops_dir，在轨迹上记下相对路径，然后丢掉数组引用。
+
+    写入前先清空目录：换一组参数重跑往往产生更少的轨迹，留着上一轮的
+    track_N.jpg 会让目录内容与 tracks.json 对不上。
+    """
+    if os.path.isdir(crops_dir):
+        shutil.rmtree(crops_dir)
     os.makedirs(crops_dir, exist_ok=True)
     for track in tracks:
-        best = max(
-            track.detections,
-            key=lambda d: (d.blur_var or 0.0) * d.confidence,
-        )
-        track.representative_frame = best.frame_index
-        track.representative_time = best.time
-        track.representative_bbox = best.bbox
-
-        frame_path = frame_paths.get(best.frame_index)
-        if not frame_path:
-            continue
-        image = cv2.imread(frame_path)
+        image = track.representative_image
+        track.representative_image = None
         if image is None:
             continue
-        x1, y1, x2, y2 = best.bbox
-        h, w = image.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            continue
         crop_name = f"track_{track.track_id}.jpg"
-        cv2.imwrite(os.path.join(crops_dir, crop_name), image[y1:y2, x1:x2])
-        track.representative_crop = os.path.join("crops", crop_name)
+        if imwrite_unicode(os.path.join(crops_dir, crop_name), image):
+            track.representative_crop = os.path.join("crops", crop_name)
 
 
 # === 5. 角色识别 ===
@@ -324,26 +433,20 @@ def _cluster_by_difference(diff_matrix, threshold: float) -> List[int]:
     return labels
 
 
-def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
-    """用 CCIP 对轨迹代表裁剪图聚类，给每条轨迹写入 character_id。
+def compute_ccip_differences(
+    tracks: List[Track],
+    out_dir: str,
+) -> Tuple[List[Track], Optional[np.ndarray]]:
+    """对有代表裁剪图的轨迹批量提取 CCIP 特征，返回两两差异矩阵。
 
-    对每条有代表裁剪图的轨迹批量提取 CCIP 特征，做 complete-linkage
-    层次聚类（簇内任意两张裁剪图差异都 < 阈值），同一簇视为同一角色。
-    无裁剪图（或文件缺失）的轨迹保持 character_id=None，不参与后续
-    窗口内的角色计数。
-
-    阈值取 config.ccip_threshold；为 None 时使用 imgutils 的
-    ccip_default_threshold()（约 0.178）。
+    这是整个角色识别里唯一昂贵的一步（要跑 ONNX 推理），且结果与合并阈值
+    无关，因此单独拆出来——阈值扫描可以只算一次、复用到所有阈值上。
 
     返回：
-        识别出的不同角色总数。
+        (候选轨迹, N×N 差异矩阵)；没有候选轨迹时矩阵为 None。
     """
     # 延迟导入：CCIP 模型较重且首次使用需从 HuggingFace 下载，
-    from imgutils.metrics import (
-        ccip_batch_differences,
-        ccip_batch_extract_features,
-        ccip_default_threshold,
-    )
+    from imgutils.metrics import ccip_batch_differences, ccip_batch_extract_features
 
     candidates: List[Track] = []
     crop_paths: List[str] = []
@@ -357,11 +460,7 @@ def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
         crop_paths.append(crop_path)
 
     if not candidates:
-        return 0
-
-    threshold = config.ccip_threshold
-    if threshold is None:
-        threshold = ccip_default_threshold()
+        return [], None
 
     # 分批提取：一次性送入几百张图会让 ONNX 推理内存分配失败（bad allocation）。
     batch_size = 32
@@ -370,8 +469,32 @@ def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
         for i in range(0, len(crop_paths), batch_size)
     ]
     features = np.concatenate(feature_batches)
-    diff_matrix = ccip_batch_differences(features)
-    cluster_ids = _cluster_by_difference(diff_matrix, threshold)
+    return candidates, ccip_batch_differences(features)
+
+
+def resolve_ccip_threshold(config: Config) -> float:
+    """取 config.ccip_threshold；为 None 时用 imgutils 的默认阈值（约 0.178）。"""
+    if config.ccip_threshold is not None:
+        return config.ccip_threshold
+    from imgutils.metrics import ccip_default_threshold
+
+    return ccip_default_threshold()
+
+
+def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
+    """用 CCIP 对轨迹代表裁剪图聚类，给每条轨迹写入 character_id。
+
+    对候选轨迹的差异矩阵做 complete-linkage 层次聚类（簇内任意两张裁剪图
+    差异都 < 阈值），同一簇视为同一角色。无裁剪图（或文件缺失）的轨迹保持
+    character_id=None，不参与后续窗口内的角色计数。
+
+    返回：
+        识别出的不同角色总数。
+    """
+    candidates, diff_matrix = compute_ccip_differences(tracks, out_dir)
+    if diff_matrix is None:
+        return 0
+    cluster_ids = _cluster_by_difference(diff_matrix, resolve_ccip_threshold(config))
     for track, cluster_id in zip(candidates, cluster_ids):
         track.character_id = cluster_id
     return len(set(cluster_ids))
@@ -484,6 +607,17 @@ def probe_duration(config: Config, video_path: str) -> float:
     return float(out.stdout.strip())
 
 
+def force_utf8_stdout() -> None:
+    """把 stdout/stderr 切到 UTF-8。
+
+    Windows 控制台默认按本地 ANSI 代码页（简中为 936/GBK）编码输出，
+    中文片名和中文日志到了 UTF-8 终端就是一片乱码。放在 CLI 入口调用。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def _write_json(path: str, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -533,23 +667,121 @@ def _report_providers(detector: Detector) -> None:
         print(f"  active session providers: {active}")
 
 
-def _save_visualization(viz_dir: str, frame_path: str, detections: List[Detection]) -> None:
-    """在帧上绘制框和分数并保存。"""
-    image = cv2.imread(frame_path)
-    if image is None:
-        return
+def _annotate(image_bgr: np.ndarray, detections: List[Detection]) -> bytes:
+    """在帧的副本上绘制框和分数，编码成 JPEG 字节返回。
+
+    流式下无法预先知道总帧数，可视化样本要靠蓄水池采样从整段视频里均匀抽取；
+    直接留整帧太占内存（1080p ≈ 6MB/张），因此当场压成 JPEG（≈200KB/张）
+    再进池子。
+    """
+    canvas = image_bgr.copy()
     for det in detections:
         x1, y1, x2, y2 = det.bbox
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
-            image, f"{det.confidence:.2f}", (x1, max(0, y1 - 5)),
+            canvas, f"{det.confidence:.2f}", (x1, max(0, y1 - 5)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
         )
-    os.makedirs(viz_dir, exist_ok=True)
-    cv2.imwrite(os.path.join(viz_dir, os.path.basename(frame_path)), image)
+    return cv2.imencode(".jpg", canvas)[1].tobytes()
 
 
 # === 主流程 ===
+
+def scan_video(
+    config: Config,
+    video_path: str,
+    out_dir: str,
+    detector: Detector,
+    limit_seconds: Optional[float] = None,
+    viz_count: int = 0,
+) -> Tuple[List[Track], List[Dict], float, int]:
+    """流式扫描一遍视频，产出轨迹和落盘的代表裁剪图。
+
+    这是流水线里唯一需要读视频的部分，也是唯一昂贵的部分。解码、镜头切换判定、
+    检测、质量过滤、跟踪全部在同一趟循环里完成，每帧用完即弃。停在轨迹这一层
+    （不做角色聚类、不选段），因为后面的阶段只依赖轨迹和裁剪图，与阈值无关，
+    可以在不重扫视频的前提下反复重跑——sweep.py 正是这么用的。
+
+    参数：
+        config: 流程配置。
+        video_path: 源视频路径。
+        out_dir: 该视频的输出目录；裁剪图写入 <out_dir>/crops/。
+        detector: 已加载的检测器实例。
+        limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
+        viz_count: 随机导出的标注示例帧数量。
+
+    返回：
+        (轨迹列表, 检测记录列表, 有效时长秒数, 采样帧数)。
+    """
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    duration = probe_duration(config, video_path)
+    if limit_seconds is not None:
+        duration = min(duration, limit_seconds)
+
+    tracker = FaceTracker(config)
+    detection_records: List[Dict] = []
+    prev_hist = None
+    num_frames = 0
+    # 蓄水池采样：流式下不知道总帧数，靠它从整段视频均匀抽 viz_count 张样本帧。
+    viz_pool: List[bytes] = []
+    viz_seen = 0
+
+    print(f"[{stem}] streaming decode + detect + track...")
+    for index, time, image in iter_frames(config, video_path, limit_seconds):
+        num_frames += 1
+        frame_h = image.shape[0]
+
+        # 与上一采样帧比较得到镜头切换标记。
+        hist = compute_hsv_hist(image) # 把每帧压成一个颜色直方图(一个 numpy 数组)
+        if prev_hist is None:
+            cut = False
+        else:
+            corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+            cut = corr < config.scene_cut_threshold
+        prev_hist = hist # prev_hist 只保留最近一帧的直方图,下一轮被新的覆盖。所以任意时刻内存里最多只有 2 个直方图
+
+        # 先检测，再应用三道质量门槛。
+        raw = detector.detect(to_pil(image), index, time) # 阶段2拿到原始检测框
+        kept = []
+        for det in raw:
+            det.crop = crop_bbox(image, det.bbox) # 当帧就地裁下来，帧一丢就没有第二次机会
+            det.blur_var = laplacian_variance(det.crop) # 计算清晰度
+            ok = passes_quality(det, frame_h, config)
+            detection_records.append(_detection_record(det, ok))
+            if ok:
+                kept.append(det)
+            else:
+                det.crop = None # 没过质量门槛的框不会成为代表，立刻释放
+
+        # 在线跟踪：轨迹在此延伸或封存，代表裁剪图也在此擂台决出。
+        tracker.update(index, cut, kept)
+
+        if viz_count > 0 and kept:
+            viz_seen += 1
+            if len(viz_pool) < viz_count:
+                viz_pool.append(_annotate(image, kept))
+            else:
+                slot = random.randrange(viz_seen)
+                if slot < viz_count:
+                    viz_pool[slot] = _annotate(image, kept)
+        # image 在此失去最后一个引用，整帧内存立即可回收。
+
+    tracks = tracker.finish()
+    print(f"[{stem}] {num_frames} frames sampled, {len(tracks)} tracks")
+
+    save_representatives(tracks, os.path.join(out_dir, "crops"))
+
+    if viz_pool:
+        viz_dir = os.path.join(out_dir, "viz")
+        if os.path.isdir(viz_dir):
+            shutil.rmtree(viz_dir)
+        os.makedirs(viz_dir, exist_ok=True)
+        for i, jpeg in enumerate(viz_pool, start=1):
+            with open(os.path.join(viz_dir, f"sample_{i:03d}.jpg"), "wb") as f:
+                f.write(jpeg)
+
+    return tracks, detection_records, duration, num_frames
+
 
 def process_video(
     config: Config,
@@ -558,7 +790,6 @@ def process_video(
     detector: Optional[Detector] = None,
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
-    keep_frames: bool = False,
 ) -> Dict:
     """对单个视频运行完整流程。
 
@@ -570,133 +801,69 @@ def process_video(
             同一个已加载模型。
         limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
         viz_count: 随机导出的标注示例帧数量。
-        keep_frames: 保留临时抽取帧，而不是删除。
 
     返回：
         摘要字典（也会持久化到 JSON 文件中）。
     """
     if detector is None:
         detector = get_detector(config.detector, config)
+    _report_providers(detector)
 
     stem = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = os.path.join(output_root, stem)
     os.makedirs(out_dir, exist_ok=True)
-    frames_dir = tempfile.mkdtemp(prefix=f"afc_{stem}_")
 
-    try:
-        print(f"[{stem}] extracting frames -> {frames_dir}")
-        frames = extract_frames(config, video_path, frames_dir)
-        if limit_seconds is not None:
-            frames = [f for f in frames if f[1] < limit_seconds]
-        print(f"[{stem}] {len(frames)} frames; detecting + filtering...")
+    tracks, detection_records, duration, num_frames = scan_video(
+        config, video_path, out_dir, detector, limit_seconds, viz_count
+    )
 
-        frame_paths: Dict[int, str] = {}
-        frame_detections: List[List[Detection]] = []
-        is_cut: List[bool] = []
-        detection_records: List[Dict] = []
-        prev_hist = None
-        viz_candidates: List[Tuple[str, List[Detection]]] = []
+    # 角色识别：CCIP 聚类给轨迹分配 character_id。
+    print(f"[{stem}] identifying characters...")
+    num_characters = assign_characters(tracks, out_dir, config)
+    print(f"[{stem}] {num_characters} distinct characters identified")
 
-        # 2. 检测 + 镜头切换标记
-        for index, time, path in frames: # 阶段1的extract_frames函数产出的数据结构是List[(frame_index, time_seconds, frame_path)]，和这里的index, time, path对应
-            frame_paths[index] = path
-            image = cv2.imread(path)
-            if image is None:
-                is_cut.append(False)
-                frame_detections.append([])
-                continue
-            frame_h = image.shape[0]
+    # 片段选择。
+    segments, num_qualified = select_segments(tracks, duration, config)
+    print(
+        f"[{stem}] {num_qualified} qualified windows, {len(segments)} segments selected"
+    )
 
-            # 与上一采样帧比较得到镜头切换标记。
-            hist = compute_hsv_hist(image) # 把每帧压成一个颜色直方图(一个 numpy 数组)
-            if prev_hist is None:
-                is_cut.append(False)
-            else:
-                corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
-                is_cut.append(corr < config.scene_cut_threshold)
-            prev_hist = hist # prev_hist 只保留最近一帧的直方图,下一轮被新的覆盖。所以任意时刻内存里最多只有 2 个直方图
+    # 截取片段。
+    clips_dir = os.path.join(out_dir, "clips")
+    clip_paths = clip_segments(config, video_path, segments, clips_dir)
 
-            # 先检测，再应用三道质量门槛。
-            raw = detector.detect(path, index, time) # 阶段2拿到原始检测框
-            _report_providers(detector)
-            kept = []
-            for det in raw:
-                det.blur_var = laplacian_variance(image, det.bbox) # 计算清晰度
-                ok = passes_quality(det, frame_h, config)
-                detection_records.append(_detection_record(det, ok))
-                if ok:
-                    kept.append(det)
-            frame_detections.append(kept)
-            if kept:
-                viz_candidates.append((path, kept))
-
-        # 带镜头切换断轨的跟踪。
-        print(f"[{stem}] tracking...")
-        tracks = track_faces(frame_detections, is_cut, config)
-        crops_dir = os.path.join(out_dir, "crops")
-        assign_representatives(tracks, frame_paths, crops_dir)
-
-        # 角色识别：CCIP 聚类给轨迹分配 character_id。
-        print(f"[{stem}] identifying characters...")
-        num_characters = assign_characters(tracks, out_dir, config)
-        print(f"[{stem}] {num_characters} distinct characters identified")
-
-        # 片段选择。
-        duration = probe_duration(config, video_path)
-        if limit_seconds is not None:
-            duration = min(duration, limit_seconds)
-        segments, num_qualified = select_segments(tracks, duration, config)
-        print(
-            f"[{stem}] {len(tracks)} tracks, {num_qualified} qualified windows, "
-            f"{len(segments)} segments selected"
-        )
-
-        # 截取片段。
-        clips_dir = os.path.join(out_dir, "clips")
-        clip_paths = clip_segments(config, video_path, segments, clips_dir)
-
-        # 可选的检测可视化。
-        if viz_count > 0 and viz_candidates:
-            viz_dir = os.path.join(out_dir, "viz")
-            sample = random.sample(viz_candidates, min(viz_count, len(viz_candidates)))
-            for path, dets in sample:
-                _save_visualization(viz_dir, path, dets)
-
-        # 持久化输出。
-        _write_json(os.path.join(out_dir, "detections.json"), detection_records)
-        _write_json(
-            os.path.join(out_dir, "tracks.json"),
-            [_track_record(t) for t in tracks],
-        )
-        _write_json(
-            os.path.join(out_dir, "windows.json"),
-            {
-                "video": video_path,
-                "duration": round(duration, 3),
-                "num_tracks": len(tracks),
-                "num_qualified_windows": num_qualified,
-                "params": dataclasses.asdict(config),
-                "segments": segments,
-                "clips": [os.path.relpath(p, out_dir) for p in clip_paths],
-            },
-        )
-
-        summary = {
+    # 持久化输出。
+    _write_json(os.path.join(out_dir, "detections.json"), detection_records)
+    _write_json(
+        os.path.join(out_dir, "tracks.json"),
+        [_track_record(t) for t in tracks],
+    )
+    _write_json(
+        os.path.join(out_dir, "windows.json"),
+        {
             "video": video_path,
-            "frames": len(frames),
-            "tracks": len(tracks),
-            "qualified_windows": num_qualified,
-            "segments": len(segments),
-            "clips": len(clip_paths),
-            "output_dir": out_dir,
-        }
-        print(f"[{stem}] done: {summary}")
-        return summary
-    finally:
-        if keep_frames:
-            print(f"[{stem}] frames kept at {frames_dir}")
-        else:
-            shutil.rmtree(frames_dir, ignore_errors=True)
+            "duration": round(duration, 3),
+            "num_tracks": len(tracks),
+            "num_characters": num_characters,
+            "num_qualified_windows": num_qualified,
+            "params": dataclasses.asdict(config),
+            "segments": segments,
+            "clips": [os.path.relpath(p, out_dir) for p in clip_paths],
+        },
+    )
+
+    summary = {
+        "video": video_path,
+        "frames": num_frames,
+        "tracks": len(tracks),
+        "characters": num_characters,
+        "qualified_windows": num_qualified,
+        "segments": len(segments),
+        "clips": len(clip_paths),
+        "output_dir": out_dir,
+    }
+    print(f"[{stem}] done: {summary}")
+    return summary
 
 
 def run_pipeline(
@@ -738,13 +905,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).") # 视频编码器（默认 h264_nvenc）。失败会自动回退到 libx264；无 GPU 时显式传 libx264。
     # 运行 / 调试参数。
     parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
-    parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.") # 导出 N 张带标注的样本帧，用于肉眼检查检测/过滤效果（默认 0，不导出）。
-    parser.add_argument("--keep-frames", action="store_true", help="Keep temp frames.") # 保留临时抽帧目录（默认清理），便于排查。
+    parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.") # 导出 N 张带标注的样本帧（蓄水池采样，均匀分布于全片），用于肉眼检查检测/过滤效果（默认 0，不导出）。
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI 入口。"""
+    force_utf8_stdout()
     args = _build_arg_parser().parse_args(argv)
 
     config = Config()
@@ -769,7 +936,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.output_dir,
         limit_seconds=args.limit_seconds,
         viz_count=args.viz,
-        keep_frames=args.keep_frames,
     )
     return 0
 
