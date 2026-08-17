@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./prompt.txt)",
+      "Bash(cat prompt.txt*)",
+      "Bash(cat ./prompt.txt*)",
+      "Bash(type prompt.txt*)"
+    ]
+  }
+}
