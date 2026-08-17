@@ -53,7 +53,10 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"   #
 & $py src/main.py "data/魔女之旅_760s（人脸数期望：2+5+1+0+3+1）（跨镜头身份去重后期望：9）.mp4" --min-events 5
 & $py src/main.py <video> --limit-seconds 60 --viz 8   # 调参：只跑前 60s + 导出 8 张标注帧
 & $py src/sweep.py <video>                             # 阈值敏感性网格扫描 → output/sweep.csv
-& $py -m pytest tests -q                               # 82 个纯逻辑单测，1.7s，不需要 GPU/模型/网络
+& $py src/evaluate.py data/*.mp4                       # 召回率评估（出厂配置）→ output/recall.csv
+& $py src/evaluate.py data/*.mp4 --ccip 0.08,0.12,0.178   # 阈值网格上扫召回
+& $py src/evaluate.py data/*.mp4 --eyes 2              # 打开正脸过滤做对照
+& $py -m pytest tests -q                               # 99 个纯逻辑单测，2s，不需要 GPU/模型/网络
 & $py -m pytest tests/test_streaming.py::TestDetectCuts -q
 & $py -m pytest "tests/test_main.py::TestSelectSegments::test_single_qualified_window" -q
 ```
@@ -78,6 +81,9 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 | `src/detectors.py` | `Detection` 数据契约 + `Detector` 抽象基类 + `@register` 名称注册表 + imgutils YOLOv8 动漫脸实现。**风格路由要新增的检测器加在这里** |
 | `src/main.py` | 七阶段流水线 + CLI |
 | `src/sweep.py` | 在 `ccip_threshold × min_events_per_window` 网格上重跑聚类与选段。视频只解码一次、CCIP 特征只提一次，加格子几乎免费 |
+| `src/style.py` | 画风路由：抽帧投票判 2d / non_2d + `apply_style` 按风格覆盖 Config。只碰 `ccip_threshold` |
+| `src/groundtruth.py` | 纯解析：文件名标注 → `GroundTruth`。不做 I/O、不碰视频 |
+| `src/evaluate.py` | 召回率评估。复用 `sweep.py` 同款切分：扫一次视频、提一次特征，网格上只重跑聚类 |
 | `README.md` | 逐阶段数据流 + 决策理由 + 多个被否掉的旧方案及其实测数据。**流水线行为变了要同步更新它**；但其中的实测数字属于已不存在的 `data/1.mp4`，别当现状引用 |
 
 `scan_video` 停在轨迹层（不聚类、不选段），因为后续阶段与阈值无关、可在不重扫视频的前提下反复重跑——`sweep.py` 正是这么用的。改动时保持这个切分。
@@ -102,18 +108,19 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 - **`ccip_threshold` 与 `min_events_per_window` 互相补偿**，任一个都无法单独解释最终片段数（旧素材上 0.05→198 个角色，0.25→25 个；片段数摆动 33 倍）。换素材或改门槛前先跑 `sweep.py`，不要凭单次运行的数字定参。
 - 输出目录名取视频文件名 stem，`save_representatives` 写入前先清空 `crops/`，保证重跑幂等。
 
-## 重启后待做的改造（当前代码还没做到）
+## 重启后的四项改造：已全部落地（2026-08-18）
 
-1. **窗口与门槛**：`window_seconds` 15.0 → **30**；`min_events_per_window` 13 → 目标 **X 人（素材实测落在 1~10）**。当前默认值在 30 秒素材上几乎选不出片段。
-2. **风格路由**：均匀抽帧 → 投票判断真人 / 2D / 3D → 路由到对应模型与参数集。判断条件待定；`imgutils.validate.anime_real` 已验证可用（返回 `('anime', 0.98)` 这类二分类），**2D vs 3D 还没有现成分类器**，需要另想（`anime_style_age` 或自定手工特征）。插拔点是 `detectors.py` 的 `@register` 注册表。
-3. **正脸过滤**：脸上没检出两只眼睛就排除。`imgutils.detect.detect_eyes` 已验证可用（对 crops 返回 2 只眼）。这是"粗糙化"的核心手段，目的是提高跨镜头去重的准确率。注意上面的流式约束：要在当帧算、结果挂在 `Detection` 上。
-4. **召回率测量**：解析文件名里的标注当真值，算召回。这是重启后唯一有意义的验收指标，目前**没有任何评估脚本**。
+1. **窗口与门槛**：`window_seconds = 30`（需求口径，别再当可调参数）、`min_events_per_window = 4`（真值下界）。
+2. **风格路由**：`src/style.py`，抽 8 帧用 `imgutils.validate.anime_classify` 投票判 2d / non_2d，只路由 `ccip_threshold`（config 的 `style_ccip_threshold` 表）。**9/9 判对**。它的 `3d` 类同时收下真人和 3D CG，**区分不了两者**——目前不需要区分（误差方向一致）。
+3. **正脸过滤**：`config.require_eyes` + `--eyes N`，已实现但**默认关闭（0），因为实测有害**。detect_eyes 是动漫眼检测器，对真人/3D 几乎不触发（爱情神话_1525s 23 条轨迹 → 0），2D 上各自调优后 F1 也是 0.89 vs 0.82。**不要因为它"看起来该开"就把默认值改回 2**，README 第六之二节有完整 A/B。
+4. **召回评估**：`src/evaluate.py` + `src/groundtruth.py`。
 
-### 当前基线（2026-08-17 实测，`src/sweep.py data/*.mp4`）
+### 当前基线（2026-08-18 实测，`src/evaluate.py data/*.mp4`）
 
-9 段素材各 100 个采样帧。完整表格与解读在 [README.md](./README.md) 第六节，结论三条：
+出厂配置（画风路由开、正脸过滤关）下 9 段素材：**macro 召回 0.96、micro 0.96、macro F1 0.90、画风路由 9/9**。逐视频表格与阈值网格在 [README.md](./README.md) 第六之二节。要点：
 
-- **切镜不是瓶颈**：scdet 刀数 +1 与真值镜头数 4 段完全一致、其余 ±1~2（偏多为主，符合"宁多勿少"）。
-- **跨镜头去重是瓶颈，且没有通用阈值**：最贴真值的 `ccip_threshold` 按素材在 0.05 / 0.10 / 0.178 / 0.25 之间跳，**没有一个值能同时对上 9 段**。默认 0.05 在 2D 素材上把角色数放大到真值的 2~6 倍（高木 40 vs 7、JOJO 38 vs 9），等于没去重。
-- **误差方向随画风翻转**（分风格路由的直接证据）：在 0.178 上 2D 普遍高估（魔女 11 vs 9），3D 与真人普遍低估（凡人_695 3 vs 7、爱情神话_925 4 vs 11）——CCIP 按动漫角色图训练，真人/3D 的脸在它的特征空间里挤成一团。
-- 真值角色数落在 **4~11**，`min_events_per_window=13` 高于所有素材真值，默认参数下不可能选出合格片段。
+- **选阈值看 F1 列，不看召回列**。数量召回被截断在 1.0，把一个角色拆成十个也是满分；必须和 `ratio`（未截断的 检出/真值）一起读。低阈值那几行 0.98 召回 / 0.52 F1 就是这个陷阱。
+- **画风路由把 macro F1 从 0.79 抬到 0.90**：分风格最优阈值互相冲突（2D 0.178 / 3D 0.08 / 真人 0.12），单一阈值全局最优只到 0.79。这是路由存在的直接证据。
+- **唯一明显漏检的是 `新世纪福音战士_1270s`（召回 0.71）**，瓶颈在检测/过滤环（全片仅 12 条轨迹，远景多、脸被 `min_face_height_ratio` 刷掉），**不是去重环**，调 `ccip_threshold` 救不了。
+- 满分召回的 7 段有 6 段 `ratio > 1`（轻度过检）。这是有意的方向：门槛是"至少 X 人"，过检只多选片段，漏检会静默丢掉合格片段。
+- 那两个阈值是对 9 个样本拟合出来的，**换素材必须重跑 `evaluate.py --ccip` 网格重新定值**。

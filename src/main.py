@@ -45,7 +45,8 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 from config import Config
-from detectors import Detection, Detector, get_detector
+from detectors import Detection, Detector, count_eyes, get_detector
+from style import apply_style, classify_style
 
 # 重新导出，方便调用方使用 from src.main import Detection。
 # 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
@@ -193,7 +194,11 @@ def laplacian_variance(crop_bgr: Optional[np.ndarray]) -> float:
 
 
 def passes_quality(detection: Detection, frame_height: int, config: Config) -> bool:
-    """应用三道质量门槛：置信度、人脸大小、清晰度。"""
+    """应用三道便宜的质量门槛：置信度、人脸大小、清晰度。
+
+    这三道都是纯算术，不做推理。正脸判定（眼睛数）单独放在
+    :func:`passes_frontal`，因为它要跑一次 ONNX，只值得对已经通过这里的脸算。
+    """
     if detection.confidence < config.conf_threshold:
         return False
     face_height = detection.bbox[3] - detection.bbox[1]
@@ -202,6 +207,18 @@ def passes_quality(detection: Detection, frame_height: int, config: Config) -> b
     if (detection.blur_var or 0.0) < config.blur_var_threshold:
         return False
     return True
+
+
+def passes_frontal(detection: Detection, config: Config) -> bool:
+    """正脸门槛：裁剪图上检出的眼睛数达到 ``config.require_eyes``。
+
+    ``require_eyes == 0`` 时直接放行（不跑推理、``num_eyes`` 保持 None）。
+    """
+    if config.require_eyes <= 0:
+        return True
+    if detection.num_eyes is None:
+        detection.num_eyes = count_eyes(detection.crop, config)
+    return detection.num_eyes >= config.require_eyes
 
 
 # === 4. 跟踪 ===
@@ -722,6 +739,7 @@ def _detection_record(det: Detection, kept: bool) -> Dict:
         "confidence": round(det.confidence, 4),
         "label": det.label,
         "blur_var": round(det.blur_var, 2) if det.blur_var is not None else None,
+        "num_eyes": det.num_eyes,
         "kept": kept,
     }
 
@@ -841,7 +859,9 @@ def scan_video(
         for det in raw:
             det.crop = crop_bbox(image, det.bbox) # 当帧就地裁下来，帧一丢就没有第二次机会
             det.blur_var = laplacian_variance(det.crop) # 计算清晰度
-            ok = passes_quality(det, frame_h, config)
+            # 先过三道便宜门槛，再对幸存者跑眼睛检测（正脸判定），避免给注定
+            # 被刷掉的脸白跑一次推理。
+            ok = passes_quality(det, frame_h, config) and passes_frontal(det, config)
             detection_records.append(_detection_record(det, ok))
             if ok:
                 kept.append(det)
@@ -908,6 +928,14 @@ def process_video(
     out_dir = os.path.join(output_root, stem)
     os.makedirs(out_dir, exist_ok=True)
 
+    # 画风路由：先判 2D / 非 2D，再据此换掉 ccip_threshold。必须在扫描之前做，
+    # 因为路由后的 config 要一路带到聚类阶段。
+    style = "-"
+    if config.style_routing:
+        style, votes = classify_style(video_path, config)
+        config = apply_style(config, style)
+        print(f"[{stem}] style={style} {votes} -> ccip_threshold={resolve_ccip_threshold(config)}")
+
     tracks, detection_records, duration, num_frames, cuts = scan_video(
         config, video_path, out_dir, detector, limit_seconds, viz_count
     )
@@ -938,6 +966,7 @@ def process_video(
         {
             "video": video_path,
             "duration": round(duration, 3),
+            "style": style,
             "num_tracks": len(tracks),
             "num_characters": num_characters,
             "num_qualified_windows": num_qualified,
@@ -983,11 +1012,8 @@ def run_pipeline(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Anime face clipper.")
-    # 位置参数：输入视频，可传多个；不填则处理 data/1.mp4。例：python src/main.py a.mp4 b.mp4
-    parser.add_argument(
-        "videos", nargs="*", default=["data/1.mp4"],
-        help="Input video path(s). Default: data/1.mp4",
-    )
+    # 位置参数：输入视频，可传多个。例：python src/main.py a.mp4 b.mp4
+    parser.add_argument("videos", nargs="+", help="Input video path(s).")
     # 输出根目录，默认 output。
     parser.add_argument("--output-dir", default="output", help="Output base directory.")
     # 便于校准的覆盖参数：不填则用 config.py 中的默认值（见 main() 应用逻辑）。
@@ -998,6 +1024,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ccip-threshold", type=float, help="Override ccip_threshold.") # CCIP 角色合并阈值（默认用模型自带阈值 ≈0.178）。调高更容易把不同轨迹合并为同一角色。
     parser.add_argument("--frame-interval", type=float, help="Override frame_interval.") # 抽帧间隔秒数（默认 0.3）。调小则采样更密、更慢更准。
     parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).") # 视频编码器（默认 h264_nvenc）。失败会自动回退到 libx264；无 GPU 时显式传 libx264。
+    parser.add_argument("--no-eyes", action="store_true", help="Disable frontal-face (two-eye) filter.") # 关掉正脸过滤。开着（默认）会丢掉侧脸/背身，跨镜头去重更准但召回更低。
+    parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one ccip_threshold for all.") # 关掉画风路由，所有素材共用 config.ccip_threshold。
     # 运行 / 调试参数。
     parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
     parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.") # 导出 N 张带标注的样本帧（蓄水池采样，均匀分布于全片），用于肉眼检查检测/过滤效果（默认 0，不导出）。
@@ -1024,6 +1052,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.frame_interval = args.frame_interval
     if args.encoder is not None:
         config.encoder = args.encoder
+    if args.no_eyes:
+        config.require_eyes = 0
+    if args.no_style_routing:
+        config.style_routing = False
 
     run_pipeline(
         config,

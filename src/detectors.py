@@ -30,6 +30,8 @@ class Detection:
         confidence: 检测器置信度，范围为 ``[0, 1]``。
         label: 检测类别（例如 ``"anime_face"``）。
         blur_var: 裁剪图的拉普拉斯方差；由过滤阶段填充。
+        num_eyes: 裁剪图上检出的眼睛数，由过滤阶段填充（正脸判定）。None 表示没算过
+            （关闭了正脸过滤，或这张脸在更便宜的门槛上就被刷掉了）。
         crop: 该框对应的 BGR 裁剪图，由过滤阶段填充。流式处理中整帧读完即弃，
             无法事后回查，因此裁剪图必须在当帧就地留下。跟踪器在把检测结果
             并入轨迹时会挑出最优的一张留存、其余立即置 None 释放，
@@ -42,6 +44,7 @@ class Detection:
     confidence: float
     label: str
     blur_var: Optional[float] = None
+    num_eyes: Optional[int] = None
     crop: Optional["object"] = None
 
 
@@ -100,6 +103,42 @@ def get_detector(name: str, config: Config) -> Detector:
             f"Unknown detector {name!r}. Registered: {sorted(_REGISTRY)!r}"
         )
     return _REGISTRY[name](config)
+
+
+# === 正脸判定（眼睛计数）===
+
+_detect_eyes = None
+
+
+def count_eyes(crop_bgr, config: Config) -> int:
+    """数一张人脸裁剪图上能检出几只眼睛。
+
+    正脸过滤的判据：两只眼都在 = 正脸。侧脸只看得到一只，背身/低头一只都没有，
+    而这两类脸的 CCIP 特征最不可靠，是跨镜头身份去重的主要噪声来源。
+
+    流式约束：必须在检测的当帧、拿着裁剪图时就算完，结果挂回 Detection。
+    帧一丢就没有第二次机会回头读像素。
+
+    参数：
+        crop_bgr: 人脸区域的 BGR 裁剪图（``crop_bbox`` 的产物）。
+        config: 取 ``eye_conf_threshold``。
+
+    返回：
+        检出的眼睛数量；裁剪图为空时返回 0。
+    """
+    global _detect_eyes
+    if _detect_eyes is None:
+        # 延迟导入：模型较重，且只有开启正脸过滤时才需要。
+        from imgutils.detect import detect_eyes
+
+        _detect_eyes = detect_eyes
+    if crop_bgr is None or crop_bgr.size == 0:
+        return 0
+    import cv2
+    from PIL import Image
+
+    image = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+    return len(_detect_eyes(image, conf_threshold=config.eye_conf_threshold))
 
 
 # === imgutils 动漫脸检测器 ===
