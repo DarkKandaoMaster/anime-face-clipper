@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -160,14 +161,6 @@ def imwrite_unicode(path: str, image_bgr: np.ndarray) -> bool:
         return False
     buf.tofile(path)
     return True
-
-
-def compute_hsv_hist(image_bgr):
-    """计算归一化 HSV（H、S）直方图，把每帧压成一个颜色直方图，用于镜头切换比较。"""
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
-    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
 
 
 # === 3. 过滤 ===
@@ -502,10 +495,41 @@ def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
 
 # === 6. 选段 ===
 
+def _characters_in_window(
+    ordered: List[Track],
+    starts: List[float],
+    t: float,
+    window: float,
+) -> Tuple[List[int], List[Track]]:
+    """窗口 [t, t+window) 内出现过的不同角色 id 与相交轨迹。
+
+    主循环和吸附后的复核共用这一份逻辑——复核不是可选的：windows.json 会记录
+    每个片段的 character_count 和 character_ids，吸附后不重算就会写出与实际
+    片段不符的数字。
+    """
+    hi = bisect.bisect_left(starts, t + window) # 二分取前缀：下标 [0, hi) 的轨迹满足 start_time < t+window（窗口右端开区间）
+    overlapping = [tr for tr in ordered[:hi] if tr.end_time >= t] # 再线性筛掉窗口开始前就已结束的轨迹，剩下的即与窗口相交
+    character_ids = sorted(
+        {tr.character_id for tr in overlapping if tr.character_id is not None}
+    )
+    return character_ids, overlapping
+
+
+def _nearest_cut(t: float, cuts: List[float], max_shift: float) -> Optional[float]:
+    """距 t 最近的切镜时刻；没有或超出 max_shift 时返回 None（max_shift=0 即关闭）。"""
+    if not cuts or max_shift <= 0:
+        return None
+    i = bisect.bisect_left(cuts, t)
+    candidates = cuts[max(0, i - 1):i + 1]
+    best = min(candidates, key=lambda c: abs(c - t))
+    return best if abs(best - t) <= max_shift else None
+
+
 def select_segments(
     tracks: List[Track],
     duration: float,
     config: Config,
+    cuts: Optional[List[float]] = None,
 ) -> Tuple[List[Dict], int]:
     """滑动窗口统计出现过的不同角色数，并贪心选择片段。
 
@@ -515,6 +539,11 @@ def select_segments(
     character_id 的数量达到 min_events_per_window 时窗口合格；
     character_id 为 None（身份未知）的轨迹不参与角色计数。遇到合格
     窗口时输出对应片段，下一个候选窗口跳到 >= t+W，从而保证片段不重叠。
+
+    传入 cuts（scdet 给出的切镜时刻表）时，合格窗口的起点会吸附到
+    clip_snap_max_shift 秒内最近的切镜点——否则片段起点只是任意的
+    k×frame_interval，大概率切在镜头中间。吸附后在新位置重新统计角色数，
+    仍达标才采用，否则保持原起点。
 
     返回：
         元组 (segments, num_qualified_windows)，其中每个片段都是包含
@@ -532,23 +561,28 @@ def select_segments(
         t = k * step
         if t + window > duration + 1e-6:
             break
-        hi = bisect.bisect_left(starts, t + window) # 二分取前缀：下标 [0, hi) 的轨迹满足 start_time < t+window（窗口右端开区间）
-        overlapping = [tr for tr in ordered[:hi] if tr.end_time >= t] # 再线性筛掉窗口开始前就已结束的轨迹，剩下的即与窗口相交
-        character_ids = sorted(
-            {tr.character_id for tr in overlapping if tr.character_id is not None}
-        )
+        character_ids, overlapping = _characters_in_window(ordered, starts, t, window)
         if len(character_ids) >= config.min_events_per_window:
             num_qualified += 1
+            start = t
+            snapped = _nearest_cut(t, cuts or [], config.clip_snap_max_shift)
+            if snapped is not None and snapped + window <= duration + 1e-6:
+                snapped_ids, snapped_overlapping = _characters_in_window(
+                    ordered, starts, snapped, window
+                )
+                if len(snapped_ids) >= config.min_events_per_window:
+                    start = snapped
+                    character_ids, overlapping = snapped_ids, snapped_overlapping
             segments.append(
                 {
-                    "start": round(t, 3),
-                    "end": round(t + window, 3),
+                    "start": round(start, 3),
+                    "end": round(start + window, 3),
                     "character_count": len(character_ids),
                     "character_ids": character_ids,
                     "track_ids": [tr.track_id for tr in overlapping],
                 }
             )
-            k = math.ceil((t + window) / step - 1e-9) # math.ceil((t + window) / step)取最小的满足条件的整数，后面的 - 1e-9 是为了浮点防抖，防浮点误差
+            k = math.ceil((start + window) / step - 1e-9) # math.ceil((start + window) / step)取最小的满足条件的整数，后面的 - 1e-9 是为了浮点防抖，防浮点误差
         else:
             k += 1
     return segments, num_qualified
@@ -605,6 +639,63 @@ def probe_duration(config: Config, video_path: str) -> float:
     ]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return float(out.stdout.strip())
+
+
+def detect_cuts(
+    config: Config,
+    video_path: str,
+    limit_seconds: Optional[float] = None,
+) -> List[float]:
+    """用 ffmpeg scdet 滤镜全帧率扫一趟，返回镜头切换时刻（秒，升序）。
+
+    为什么不是直方图：旧实现比较相邻采样帧的 HSV 直方图相关性，在 9 段素材上
+    召回/精确只有 51%/51%，且在 EVA 这类以亮度变化为主的片段上完全失效（0%）。
+    根因是它无状态——只看相邻两帧，无法区分"变化大是因为切镜"和"变化大是因为
+    整个镜头本来就在剧变"。scdet 的 score 取「帧间差异」与「帧间差异相对上一次的
+    跳变量」的较小值，持续剧变被压制、孤立尖峰才上报，这是改通道或改阈值补不上的
+    结构性差异。代价是多一趟全帧率解码（实测 6.4s/300s）。
+
+    参数：
+        config: 流程配置（用到 ffmpeg、scdet_threshold）。
+        video_path: 源视频。
+        limit_seconds: 若给定，只扫前 N 秒。
+
+    返回：
+        升序的切镜时刻列表。空列表是合法结果（确实存在整段无切镜的素材）。
+    """
+    cmd = [config.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "info"]
+    if limit_seconds is not None:
+        cmd += ["-t", f"{limit_seconds:.3f}"]
+    cmd += [
+        "-i", video_path,
+        "-an",
+        "-vf", f"scdet=threshold={config.scdet_threshold}",
+        "-f", "null", "-",
+    ]
+    # encoding/errors 显式指定：中文路径与中文日志在 Windows 默认 ANSI 解码下会炸。
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
+    if result.returncode != 0:
+        tail = "\n".join((result.stderr or "").splitlines()[-15:])
+        raise RuntimeError(f"ffmpeg scdet 失败（{video_path}）：\n{tail}")
+    # scdet 把切镜时刻写进帧 metadata，日志里形如 "lavfi.scd.time: 12.345"。
+    return sorted(
+        float(t) for t in re.findall(r"lavfi\.scd\.time:\s*([\d.]+)", result.stderr or "")
+    )
+
+
+def _cut_between(cuts: List[float], prev_time: float, time: float, tol: float) -> bool:
+    """区间 (prev_time-tol, time+tol] 内是否存在切镜时刻。
+
+    抽成纯函数是为了不依赖视频即可单测。容差存在的理由：scdet 报的是真实 PTS，
+    而采样帧时间戳是 raw_index / fps；叠加溶解转场本身也没有单帧答案。
+    往灵敏侧放是对的——误差不对称：漏一刀会把两个角色粘成一条轨迹、静默丢掉一个
+    角色；多切一刀只是把轨迹断成两段，阶段 5 的 CCIP 聚类会还原成同一个角色。
+    """
+    lo = bisect.bisect_right(cuts, prev_time - tol)
+    hi = bisect.bisect_right(cuts, time + tol)
+    return hi > lo
 
 
 def force_utf8_stdout() -> None:
@@ -694,10 +785,10 @@ def scan_video(
     detector: Detector,
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
-) -> Tuple[List[Track], List[Dict], float, int]:
+) -> Tuple[List[Track], List[Dict], float, int, List[float]]:
     """流式扫描一遍视频，产出轨迹和落盘的代表裁剪图。
 
-    这是流水线里唯一需要读视频的部分，也是唯一昂贵的部分。解码、镜头切换判定、
+    这是流水线里最昂贵的部分。解码、
     检测、质量过滤、跟踪全部在同一趟循环里完成，每帧用完即弃。停在轨迹这一层
     （不做角色聚类、不选段），因为后面的阶段只依赖轨迹和裁剪图，与阈值无关，
     可以在不重扫视频的前提下反复重跑——sweep.py 正是这么用的。
@@ -710,17 +801,24 @@ def scan_video(
         limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
         viz_count: 随机导出的标注示例帧数量。
 
+    切镜表由 detect_cuts 在主循环之前单独跑一趟全帧率解码得到（scdet 需要看到
+    每一帧，0.3s 抽帧下镜头内的正常演进已与真切镜混叠）。
+
     返回：
-        (轨迹列表, 检测记录列表, 有效时长秒数, 采样帧数)。
+        (轨迹列表, 检测记录列表, 有效时长秒数, 采样帧数, 切镜时刻列表)。
     """
     stem = os.path.splitext(os.path.basename(video_path))[0]
     duration = probe_duration(config, video_path)
     if limit_seconds is not None:
         duration = min(duration, limit_seconds)
 
+    print(f"[{stem}] scdet scan (threshold={config.scdet_threshold})...")
+    cuts = detect_cuts(config, video_path, limit_seconds)
+    print(f"[{stem}] {len(cuts)} cuts detected")
+
     tracker = FaceTracker(config)
     detection_records: List[Dict] = []
-    prev_hist = None
+    prev_time: Optional[float] = None
     num_frames = 0
     # 蓄水池采样：流式下不知道总帧数，靠它从整段视频均匀抽 viz_count 张样本帧。
     viz_pool: List[bytes] = []
@@ -731,14 +829,11 @@ def scan_video(
         num_frames += 1
         frame_h = image.shape[0]
 
-        # 与上一采样帧比较得到镜头切换标记。
-        hist = compute_hsv_hist(image) # 把每帧压成一个颜色直方图(一个 numpy 数组)
-        if prev_hist is None:
-            cut = False
-        else:
-            corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
-            cut = corr < config.scene_cut_threshold
-        prev_hist = hist # prev_hist 只保留最近一帧的直方图,下一轮被新的覆盖。所以任意时刻内存里最多只有 2 个直方图
+        # 上一采样帧与本帧之间夹着切镜时刻则断轨。首帧无前帧，固定为 False。
+        cut = prev_time is not None and _cut_between(
+            cuts, prev_time, time, config.cut_time_tolerance
+        )
+        prev_time = time
 
         # 先检测，再应用三道质量门槛。
         raw = detector.detect(to_pil(image), index, time) # 阶段2拿到原始检测框
@@ -780,7 +875,7 @@ def scan_video(
             with open(os.path.join(viz_dir, f"sample_{i:03d}.jpg"), "wb") as f:
                 f.write(jpeg)
 
-    return tracks, detection_records, duration, num_frames
+    return tracks, detection_records, duration, num_frames, cuts
 
 
 def process_video(
@@ -813,7 +908,7 @@ def process_video(
     out_dir = os.path.join(output_root, stem)
     os.makedirs(out_dir, exist_ok=True)
 
-    tracks, detection_records, duration, num_frames = scan_video(
+    tracks, detection_records, duration, num_frames, cuts = scan_video(
         config, video_path, out_dir, detector, limit_seconds, viz_count
     )
 
@@ -823,7 +918,7 @@ def process_video(
     print(f"[{stem}] {num_characters} distinct characters identified")
 
     # 片段选择。
-    segments, num_qualified = select_segments(tracks, duration, config)
+    segments, num_qualified = select_segments(tracks, duration, config, cuts)
     print(
         f"[{stem}] {num_qualified} qualified windows, {len(segments)} segments selected"
     )
@@ -898,7 +993,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # 便于校准的覆盖参数：不填则用 config.py 中的默认值（见 main() 应用逻辑）。
     parser.add_argument("--conf", type=float, help="Override conf_threshold.") # 置信度阈值（默认 0.5）。调高更严格：误检少、漏检多。
     parser.add_argument("--blur-var", type=float, help="Override blur_var_threshold.") # 模糊过滤的拉普拉斯方差下限（默认 50.0）。调高丢弃更多模糊/拖影脸。
-    parser.add_argument("--scene-cut", type=float, help="Override scene_cut_threshold.") # 镜头切换阈值（默认 0.6）。调低则检测到的切换更少。
+    parser.add_argument("--scdet-threshold", type=float, help="Override scdet_threshold (0-100); lower detects more cuts.") # ffmpeg scdet 阈值（默认 10.0）。调低检测到的切换更多；CG 动作素材建议 5。
     parser.add_argument("--min-events", type=int, help="Override min_events_per_window.") # 窗口内所需不同角色数（默认 13）。调低则更多片段合格、出片更多。
     parser.add_argument("--ccip-threshold", type=float, help="Override ccip_threshold.") # CCIP 角色合并阈值（默认用模型自带阈值 ≈0.178）。调高更容易把不同轨迹合并为同一角色。
     parser.add_argument("--frame-interval", type=float, help="Override frame_interval.") # 抽帧间隔秒数（默认 0.3）。调小则采样更密、更慢更准。
@@ -919,8 +1014,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.conf_threshold = args.conf
     if args.blur_var is not None:
         config.blur_var_threshold = args.blur_var
-    if args.scene_cut is not None:
-        config.scene_cut_threshold = args.scene_cut
+    if args.scdet_threshold is not None:
+        config.scdet_threshold = args.scdet_threshold
     if args.min_events is not None:
         config.min_events_per_window = args.min_events
     if args.ccip_threshold is not None:

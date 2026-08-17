@@ -75,7 +75,7 @@ def sweep_video(
     out_dir = os.path.join(output_root, stem)
     os.makedirs(out_dir, exist_ok=True)
 
-    tracks, _detections, duration, num_frames = scan_video(
+    tracks, _detections, duration, num_frames, cuts = scan_video(
         config, video_path, out_dir, detector, limit_seconds
     )
     candidates, diff_matrix = compute_ccip_differences(tracks, out_dir)
@@ -92,7 +92,7 @@ def sweep_video(
         num_characters = len(set(labels))
         for min_events in min_events_values:
             probe = dataclasses.replace(config, min_events_per_window=min_events)
-            segments, num_qualified = select_segments(tracks, duration, probe)
+            segments, num_qualified = select_segments(tracks, duration, probe, cuts)
             rows.append(
                 {
                     "video": stem,

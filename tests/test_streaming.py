@@ -1,11 +1,13 @@
 r"""流式改造相关的单元测试。
 
 覆盖 iter_frames（解码采样与时间戳）、crop_bbox / laplacian_variance
-（当帧裁剪与清晰度）、imwrite_unicode（中文路径写图）、以及 FaceTracker
-在线挑选代表裁剪图的行为。跟踪的连接/断轨语义由 test_main.py 经
-track_faces 覆盖，此处只测批处理版没有的那部分——代表裁剪图。
+（当帧裁剪与清晰度）、imwrite_unicode（中文路径写图）、FaceTracker
+在线挑选代表裁剪图的行为，以及切镜检测（detect_cuts / _cut_between）
+与片段起点吸附（_nearest_cut / select_segments）。跟踪的连接/断轨语义由
+test_main.py 经 track_faces 覆盖，此处只测批处理版没有的那部分——代表裁剪图。
 
-测试视频由 cv2.VideoWriter 现场合成，不依赖 data/ 下的素材。
+测试视频由 cv2.VideoWriter 现场合成，不依赖 data/ 下的素材；
+detect_cuts 的用例需要 PATH 上有 ffmpeg。
 
 运行方式（Windows PowerShell，项目根目录下）：
     D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe -m pytest tests -v
@@ -21,10 +23,15 @@ from config import Config
 from detectors import Detection
 from main import (
     FaceTracker,
+    Track,
+    _cut_between,
+    _nearest_cut,
     crop_bbox,
+    detect_cuts,
     imwrite_unicode,
     iter_frames,
     laplacian_variance,
+    select_segments,
     to_pil,
 )
 
@@ -253,3 +260,169 @@ class TestFaceTrackerRepresentative:
         tracker.update(0, False, [make_det(0, 0.0, (0, 0, 100, 100))])
         assert len(tracker.finish()) == 1
         assert len(tracker.finish()) == 1  # 不会把同一条轨迹再封存一次
+
+
+# === 切镜检测（ffmpeg scdet）===
+
+class TestDetectCuts:
+    @pytest.fixture
+    def two_shot_video(self, tmp_path):
+        """纯色 A（前 2.5s）接纯色 B（后 2.5s），唯一的真切镜在 2.5s。"""
+        path = str(tmp_path / "two_shot.mp4")
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (64, 48))
+        assert writer.isOpened(), "无法创建测试视频，缺少 mp4v 编码器？"
+        for i in range(NUM_FRAMES):
+            color = (20, 20, 200) if i < NUM_FRAMES // 2 else (200, 200, 20)
+            writer.write(np.full((48, 64, 3), color, dtype=np.uint8))
+        writer.release()
+        return path
+
+    def test_finds_the_single_cut(self, two_shot_video):
+        cuts = detect_cuts(Config(), two_shot_video)
+        assert len(cuts) == 1
+        assert cuts[0] == pytest.approx(NUM_FRAMES / 2 / FPS, abs=2 / FPS)
+
+    def test_limit_seconds_stops_before_the_cut(self, two_shot_video):
+        # 切镜在 2.5s，只扫前 2s 就什么都不该报——空列表是合法结果。
+        assert detect_cuts(Config(), two_shot_video, limit_seconds=2.0) == []
+
+    def test_missing_file_fails_loudly(self, tmp_path):
+        # fail fast：ffmpeg 非零退出直接抛，不静默返回空列表。
+        with pytest.raises(RuntimeError):
+            detect_cuts(Config(), str(tmp_path / "nope.mp4"))
+
+
+class TestCutBetween:
+    CUTS = [1.0, 5.0, 9.0]
+
+    def test_cut_inside_interval(self):
+        assert _cut_between(self.CUTS, 4.7, 5.3, 0.1)
+
+    def test_no_cut_inside_interval(self):
+        assert not _cut_between(self.CUTS, 6.0, 6.6, 0.1)
+
+    def test_tolerance_extends_the_interval(self):
+        # 5.0 落在 (6.0-tol, 6.6+tol] 之外；容差放大到 1.1 才够到它。
+        assert not _cut_between(self.CUTS, 6.0, 6.6, 0.1)
+        assert _cut_between(self.CUTS, 6.0, 6.6, 1.1)
+
+    def test_left_edge_is_open(self):
+        # 区间是 (prev-tol, time+tol]：恰好落在左端点上不算。
+        assert not _cut_between([5.0], 5.1, 6.0, 0.1)
+        assert _cut_between([5.0], 5.1, 6.0, 0.11)
+
+    def test_right_edge_is_closed(self):
+        assert _cut_between([5.0], 4.0, 4.9, 0.1)
+
+    def test_empty_cuts(self):
+        assert not _cut_between([], 0.0, 100.0, 0.1)
+
+
+class TestNearestCut:
+    CUTS = [1.0, 5.0, 9.0]
+
+    def test_picks_the_closer_side(self):
+        assert _nearest_cut(4.4, self.CUTS, 2.0) == 5.0
+        assert _nearest_cut(5.9, self.CUTS, 2.0) == 5.0
+
+    def test_beyond_max_shift_returns_none(self):
+        assert _nearest_cut(7.0, self.CUTS, 1.5) is None
+
+    def test_exactly_at_max_shift_is_accepted(self):
+        assert _nearest_cut(7.0, self.CUTS, 2.0) == 5.0
+
+    def test_zero_max_shift_disables_snapping(self):
+        assert _nearest_cut(5.1, self.CUTS, 0.0) is None
+
+    def test_empty_cuts(self):
+        assert _nearest_cut(5.0, [], 2.0) is None
+
+
+# === 片段起点吸附到切镜点 ===
+
+def make_track(track_id, start_time, end_time, character_id):
+    return Track(
+        track_id=track_id,
+        label="anime_face",
+        start_time=start_time,
+        end_time=end_time,
+        detections=[],
+        character_id=character_id,
+    )
+
+
+class TestSelectSegmentsSnapping:
+    @pytest.fixture
+    def config(self):
+        # 窗口 5 秒、步进 1 秒、门槛 2 个角色、最多吸附 2 秒。
+        return Config(
+            window_seconds=5.0,
+            frame_interval=1.0,
+            min_events_per_window=2,
+            clip_snap_max_shift=2.0,
+        )
+
+    def test_start_snaps_to_nearest_cut(self, config):
+        # 两个角色横跨 0~10s，第一个合格窗口起点 0.0 被吸附到 1.5s 的切镜点。
+        tracks = [
+            make_track(1, 0.0, 10.0, 0),
+            make_track(2, 0.0, 10.0, 1),
+        ]
+        segments, _ = select_segments(tracks, 20.0, config, cuts=[1.5])
+        assert segments[0]["start"] == pytest.approx(1.5)
+        assert segments[0]["end"] == pytest.approx(6.5)
+
+    def test_snap_rejected_when_characters_drop_below_threshold(self, config):
+        # 吸附到 2.5s 会把只活到 1.0s 的角色 0 甩出窗口，角色数跌到 1，放弃吸附。
+        tracks = [
+            make_track(1, 0.0, 1.0, 0),
+            make_track(2, 0.0, 10.0, 1),
+        ]
+        segments, _ = select_segments(tracks, 20.0, config, cuts=[2.5])
+        assert segments[0]["start"] == pytest.approx(0.0)
+        assert segments[0]["character_count"] == 2
+
+    def test_snapped_segment_recounts_characters(self, config):
+        # 吸附后 character_count / character_ids / track_ids 必须是新位置上的值，
+        # 否则 windows.json 会写出与实际片段不符的数字。
+        tracks = [
+            make_track(1, 0.0, 10.0, 0),
+            make_track(2, 0.0, 10.0, 1),
+            make_track(3, 5.5, 6.0, 2),  # 只在吸附后的窗口 [1.5, 6.5) 里
+        ]
+        segments, _ = select_segments(tracks, 20.0, config, cuts=[1.5])
+        assert segments[0]["start"] == pytest.approx(1.5)
+        assert segments[0]["character_count"] == 3
+        assert segments[0]["character_ids"] == [0, 1, 2]
+        assert segments[0]["track_ids"] == [1, 2, 3]
+
+    def test_snap_never_runs_past_duration(self, config):
+        # 最近的切镜点会让窗口越过视频末尾，只能保持原起点。
+        tracks = [
+            make_track(1, 0.0, 20.0, 0),
+            make_track(2, 0.0, 20.0, 1),
+        ]
+        segments, _ = select_segments(tracks, 5.0, config, cuts=[1.0])
+        assert segments[0]["start"] == pytest.approx(0.0)
+
+    def test_no_cuts_matches_previous_behaviour(self, config):
+        tracks = [
+            make_track(1, 0.0, 10.0, 0),
+            make_track(2, 0.0, 10.0, 1),
+        ]
+        assert (
+            select_segments(tracks, 20.0, config, cuts=[])
+            == select_segments(tracks, 20.0, config)
+        )
+
+    def test_next_segment_starts_after_the_snapped_end(self, config):
+        # 贪心跳转用的是吸附后的终点，片段仍然不重叠。
+        tracks = [
+            make_track(1, 0.0, 10.0, 0),
+            make_track(2, 0.0, 10.0, 1),
+            make_track(3, 8.0, 20.0, 2),
+            make_track(4, 8.0, 20.0, 3),
+        ]
+        segments, _ = select_segments(tracks, 20.0, config, cuts=[1.5])
+        assert len(segments) >= 2
+        assert segments[0]["end"] <= segments[1]["start"]

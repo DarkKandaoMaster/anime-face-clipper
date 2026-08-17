@@ -13,16 +13,21 @@ class Config:
     """整个流程的可调参数。
 
     属性按流程阶段分组。标记为经验值的参数
-    （``blur_var_threshold``、``scene_cut_threshold``）应结合实际素材校准；
+    （``blur_var_threshold``、``scdet_threshold``）应结合实际素材校准；
     默认值有意设得偏保守，适合作为首次处理的起点。
     """
 
     # === 抽帧 / 镜头切换 ===
     # 采样帧之间的秒数（ffmpeg fps = 1 / frame_interval）。
     frame_interval: float = 0.3
-    # 相邻采样帧的 HSV 直方图相关性低于该值时视为镜头切换。
-    # 值越低，检测到的切换越少。应按画风校准。
-    scene_cut_threshold: float = 0.6
+    # ffmpeg scdet 滤镜的阈值（0-100），越低检测到的切换越多。
+    # 10 在手绘作画素材上验证过；CG 动作素材建议 5。
+    scdet_threshold: float = 10.0
+    # 切镜时刻与采样区间匹配的容差（秒）。scdet 报的是真实 PTS，
+    # 而采样帧的时间戳是 raw_index / fps，两者有亚秒级偏差。
+    cut_time_tolerance: float = 0.1
+    # 片段起点吸附到最近切镜点的最大位移（秒）。设 0 关闭吸附。
+    clip_snap_max_shift: float = 2.0
 
     # === 检测 ===
     # 已注册的检测器名称（见 detectors.py）。
