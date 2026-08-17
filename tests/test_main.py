@@ -1,4 +1,4 @@
-r"""iou / track_faces / _cluster_by_difference / select_segments 的单元测试。
+"""iou / track_faces / _cluster_by_difference / select_segments 的单元测试。
 
 这些函数都是纯计算，不触碰 ffmpeg、检测器模型或磁盘，
 因此直接构造 Detection / Track / Config 即可覆盖核心分支。

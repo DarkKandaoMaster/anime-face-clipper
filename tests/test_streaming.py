@@ -1,4 +1,4 @@
-r"""流式改造相关的单元测试。
+"""流式改造相关的单元测试。
 
 覆盖 iter_frames（解码采样与时间戳）、crop_bbox / laplacian_variance
 （当帧裁剪与清晰度）、imwrite_unicode（中文路径写图）、FaceTracker
