@@ -36,6 +36,7 @@ from typing import List, Optional
 
 from config import Config
 from main import (
+    IdentityIndex,
     _cluster_by_difference,
     compute_differences,
     force_utf8_stdout,
@@ -105,9 +106,14 @@ def sweep_video(
         for track, label in zip(candidates, labels):
             track.character_id = label
         num_characters = len(set(labels))
+        # 窗口口径的聚类也要跟着阈值走，所以索引在阈值循环里重建（只是包一层，
+        # 差异矩阵本身仍然只算了一次）。
+        identity = IdentityIndex(candidates, diff_matrix, threshold)
         for min_events in min_events_values:
             probe = dataclasses.replace(config, min_events_per_window=min_events)
-            segments, num_qualified = select_segments(tracks, duration, probe, cuts)
+            segments, num_qualified = select_segments(
+                tracks, duration, probe, cuts, identity
+            )
             rows.append(
                 {
                     "video": stem,

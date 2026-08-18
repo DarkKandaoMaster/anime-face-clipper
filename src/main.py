@@ -62,7 +62,7 @@ from style import apply_style, classify_style
 # 重新导出，方便调用方使用 from src.main import Detection。
 # 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
 __all__ = [
-    "Detection", "Track", "crop_bbox", "expand_bbox",
+    "Detection", "Track", "IdentityIndex", "crop_bbox", "expand_bbox",
     "filter_short_tracks", "process_video", "run_pipeline", "main",
 ]
 
@@ -554,23 +554,70 @@ def resolve_identity_threshold(config: Config) -> float:
     return get_embedder(config.embedder).default_threshold()
 
 
-def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
+class IdentityIndex:
+    """轨迹级差异矩阵 + 阈值，支持在任意轨迹子集上重跑聚类。
+
+    存在的理由：差异矩阵是整条流水线里唯一昂贵的产物（每张代表图一次 ONNX），
+    但聚类本身只是一次 linkage。把矩阵留在手里，就能在**任意子集**上以近乎零
+    成本重新聚类——`cluster_scope="window"` 正是靠这个把聚类范围从全片压回
+    单个 30 秒窗口，而不需要多解码一遍视频、多提一次特征。
+
+    子集聚类的结果与全片聚类**不可比**：簇编号只在这一次调用内有意义。
+    """
+
+    def __init__(self, candidates: List[Track], diff_matrix: np.ndarray, threshold: float):
+        self._rows = {track.track_id: i for i, track in enumerate(candidates)}
+        self._diff = np.asarray(diff_matrix, dtype=float)
+        self._threshold = threshold
+        # 滑窗以 frame_interval（0.3s）步进，相邻窗口的轨迹集合大多完全相同；
+        # 按行号元组记一手，长片上省掉绝大部分重复 linkage。
+        self._cache: Dict[Tuple[int, ...], int] = {}
+
+    def count(self, tracks: List[Track]) -> int:
+        """这批轨迹在**只看它们自己**时聚出几个不同角色。
+
+        没有代表裁剪图（不在矩阵里）的轨迹被忽略，与全片口径一致。
+        """
+        rows = tuple(sorted(
+            self._rows[t.track_id] for t in tracks if t.track_id in self._rows
+        ))
+        if not rows:
+            return 0
+        cached = self._cache.get(rows)
+        if cached is None:
+            index = np.asarray(rows)
+            labels = _cluster_by_difference(
+                self._diff[np.ix_(index, index)], self._threshold
+            )
+            cached = self._cache[rows] = len(set(labels))
+        return cached
+
+
+def assign_characters(
+    tracks: List[Track], out_dir: str, config: Config
+) -> Tuple[int, Optional[IdentityIndex]]:
     """对轨迹代表裁剪图聚类，给每条轨迹写入 character_id。
 
     对候选轨迹的差异矩阵做 complete-linkage 层次聚类（簇内任意两张裁剪图
     差异都 < 阈值），同一簇视为同一角色。无裁剪图（或文件缺失）的轨迹保持
     character_id=None，不参与后续窗口内的角色计数。
 
+    写入的 character_id 始终是**全片口径**，与 cluster_scope 无关——它是
+    crops/ 目录和 montage.py 唯一的身份线索。窗口口径的角色数由返回的
+    IdentityIndex 在选段阶段另算。
+
     返回：
-        识别出的不同角色总数。
+        (全片不同角色总数, 可在子集上重聚类的 IdentityIndex)；没有候选轨迹时
+        索引为 None。
     """
     candidates, diff_matrix = compute_differences(tracks, out_dir, config)
     if diff_matrix is None:
-        return 0
-    cluster_ids = _cluster_by_difference(diff_matrix, resolve_identity_threshold(config))
+        return 0, None
+    threshold = resolve_identity_threshold(config)
+    cluster_ids = _cluster_by_difference(diff_matrix, threshold)
     for track, cluster_id in zip(candidates, cluster_ids):
         track.character_id = cluster_id
-    return len(set(cluster_ids))
+    return len(set(cluster_ids)), IdentityIndex(candidates, diff_matrix, threshold)
 
 
 # === 6. 选段 ===
@@ -595,6 +642,27 @@ def _characters_in_window(
     return character_ids, overlapping
 
 
+def _window_characters(
+    ordered: List[Track],
+    starts: List[float],
+    t: float,
+    window: float,
+    config: Config,
+    identity: Optional[IdentityIndex],
+) -> Tuple[List[int], List[Track], int]:
+    """窗口 [t, t+window) 的全片口径角色 id、相交轨迹，以及**计数口径下**的角色数。
+
+    计数口径由 config.cluster_scope 决定：
+      - "video"：数全片聚类留下的不同 character_id（原行为）。
+      - "window"：只拿这些相交轨迹重跑一次聚类，数它自己聚出几个簇。
+        全片聚类里被离群图卡住的两个簇，在窗口这个小得多的子集里往往就合上了。
+    """
+    character_ids, overlapping = _characters_in_window(ordered, starts, t, window)
+    if config.cluster_scope == "window" and identity is not None:
+        return character_ids, overlapping, identity.count(overlapping)
+    return character_ids, overlapping, len(character_ids)
+
+
 def _nearest_cut(t: float, cuts: List[float], max_shift: float) -> Optional[float]:
     """距 t 最近的切镜时刻；没有或超出 max_shift 时返回 None（max_shift=0 即关闭）。"""
     if not cuts or max_shift <= 0:
@@ -610,6 +678,7 @@ def select_segments(
     duration: float,
     config: Config,
     cuts: Optional[List[float]] = None,
+    identity: Optional[IdentityIndex] = None,
 ) -> Tuple[List[Dict], int]:
     """滑动窗口统计出现过的不同角色数，并贪心选择片段。
 
@@ -619,6 +688,11 @@ def select_segments(
     character_id 的数量达到 min_events_per_window 时窗口合格；
     character_id 为 None（身份未知）的轨迹不参与角色计数。遇到合格
     窗口时输出对应片段，下一个候选窗口跳到 >= t+W，从而保证片段不重叠。
+
+    传入 identity 且 config.cluster_scope == "window" 时，窗口内的角色数改为
+    「只拿这个窗口里的轨迹重新聚类」的结果，而不是数全片聚类的 character_id
+    （见 config.cluster_scope）。片段记录里的 character_ids 仍是全片口径的
+    id，只作溯源；character_count 用的是计数口径，两者在窗口口径下可以不等长。
 
     传入 cuts（scdet 给出的切镜时刻表）时，合格窗口的起点会吸附到
     clip_snap_max_shift 秒内最近的切镜点——否则片段起点只是任意的
@@ -641,23 +715,26 @@ def select_segments(
         t = k * step
         if t + window > duration + 1e-6:
             break
-        character_ids, overlapping = _characters_in_window(ordered, starts, t, window)
-        if len(character_ids) >= config.min_events_per_window:
+        character_ids, overlapping, count = _window_characters(
+            ordered, starts, t, window, config, identity
+        )
+        if count >= config.min_events_per_window:
             num_qualified += 1
             start = t
             snapped = _nearest_cut(t, cuts or [], config.clip_snap_max_shift)
             if snapped is not None and snapped + window <= duration + 1e-6:
-                snapped_ids, snapped_overlapping = _characters_in_window(
-                    ordered, starts, snapped, window
+                snapped_ids, snapped_overlapping, snapped_count = _window_characters(
+                    ordered, starts, snapped, window, config, identity
                 )
-                if len(snapped_ids) >= config.min_events_per_window:
+                if snapped_count >= config.min_events_per_window:
                     start = snapped
                     character_ids, overlapping = snapped_ids, snapped_overlapping
+                    count = snapped_count
             segments.append(
                 {
                     "start": round(start, 3),
                     "end": round(start + window, 3),
-                    "character_count": len(character_ids),
+                    "character_count": count,
                     "character_ids": character_ids,
                     "track_ids": [tr.track_id for tr in overlapping],
                 }
@@ -1027,11 +1104,12 @@ def process_video(
 
     # 角色识别：CCIP 聚类给轨迹分配 character_id。
     print(f"[{stem}] identifying characters...")
-    num_characters = assign_characters(tracks, out_dir, config)
-    print(f"[{stem}] {num_characters} distinct characters identified")
+    num_characters, identity = assign_characters(tracks, out_dir, config)
+    print(f"[{stem}] {num_characters} distinct characters identified "
+          f"(cluster_scope={config.cluster_scope})")
 
     # 片段选择。
-    segments, num_qualified = select_segments(tracks, duration, config, cuts)
+    segments, num_qualified = select_segments(tracks, duration, config, cuts, identity)
     print(
         f"[{stem}] {num_qualified} qualified windows, {len(segments)} segments selected"
     )
@@ -1111,6 +1189,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-frontal", type=float, metavar="S", help="Drop faces whose frontal score is below S (0 = off).") # 正脸硬门槛
     parser.add_argument("--min-track-seconds", type=float, metavar="S", help="Drop tracks shorter than S seconds on screen (0 = off).") # 最短出镜时长，对应人工标注的"出镜 >1s"口径 # 正脸硬门槛：分数低于 S 的框直接丢。默认 0（关）——硬筛会连角色一起丢，见 README 第六之二节。
     parser.add_argument("--eyes", type=int, metavar="N", help="Require N eyes per face (legacy frontal filter). 0 = off (default).") # 正脸过滤：脸上至少检出 N 只眼才保留。默认 0（关）——实测有害，见 README 第六之二节；传 2 可复现那组对照。
+    parser.add_argument("--cluster-scope", choices=["video", "window"], help="Cluster identities over the whole video (default) or within each 30s window.") # 聚类范围。window = 每个候选窗口内单独聚类，参与聚类的轨迹数与片长无关。
     parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one detector/embedder/threshold for all.") # 关掉画风路由，所有素材共用 config 里的 detector / embedder / identity_threshold。
     # 运行 / 调试参数。
     parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
@@ -1149,6 +1228,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.min_frontal_score = args.min_frontal
     if args.min_track_seconds is not None:
         config.min_track_seconds = args.min_track_seconds
+    if args.cluster_scope is not None:
+        config.cluster_scope = args.cluster_scope
     if args.no_style_routing:
         config.style_routing = False
 

@@ -14,6 +14,7 @@ evaluate.py 都依赖这个切分。
 """
 
 import abc
+import os
 from typing import Dict, List, Type
 
 import cv2
@@ -77,7 +78,9 @@ class CcipEmbedder(Embedder):
     """动漫角色身份特征（imgutils CCIP）。"""
 
     # 一次性送入几百张图会让 ONNX 推理内存分配失败（bad allocation）。
-    BATCH_SIZE = 32
+    # 机器内存紧张时（本机实测可用物理内存 <3GB 就会踩）连 32 都会失败，
+    # 用 CCIP_BATCH_SIZE 环境变量临时调小，不必改代码。
+    BATCH_SIZE = int(os.environ.get("CCIP_BATCH_SIZE", "32"))
 
     def differences(self, crop_paths: List[str]) -> np.ndarray:
         from imgutils.metrics import ccip_batch_differences, ccip_batch_extract_features

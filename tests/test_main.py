@@ -9,11 +9,20 @@ _cluster_by_difference 的纯函数用例覆盖。
     D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe -m pytest tests -v
 """
 
+import dataclasses
+
 import pytest
 
 from config import Config
 from detectors import Detection
-from main import Track, _cluster_by_difference, iou, select_segments, track_faces
+from main import (
+    IdentityIndex,
+    Track,
+    _cluster_by_difference,
+    iou,
+    select_segments,
+    track_faces,
+)
 
 
 def make_det(frame_index, time, bbox, label="anime_face", confidence=0.9):
@@ -352,3 +361,78 @@ class TestSelectSegments:
         segments, num_qualified = select_segments(tracks, 10.0, config)
         assert num_qualified == 1
         assert segments[0]["character_count"] == 2
+
+
+# === 窗口口径聚类（cluster_scope="window"）===
+
+class TestWindowScopedClustering:
+    """全片聚类把一个角色拆成两簇，窗口内重聚类应把它合回去。
+
+    差异矩阵设计：轨迹 0/1/2 是同一个角色的三段出镜，但 0 与 2 之间隔着一张
+    离群图（0.9），complete-linkage 因此拒绝把它们并进同一簇——这正是长片上
+    过拆的机制。轨迹 3 是另一个角色，与谁都远。
+    """
+
+    @pytest.fixture
+    def diff(self):
+        return [
+            [0.0, 0.1, 0.9, 0.9],
+            [0.1, 0.0, 0.1, 0.9],
+            [0.9, 0.1, 0.0, 0.9],
+            [0.9, 0.9, 0.9, 0.0],
+        ]
+
+    @pytest.fixture
+    def tracks(self):
+        # 0/1 落在前 5 秒窗口，2 在后面，3 贯穿全程。
+        return [
+            make_track(10, 0.0, 1.0),
+            make_track(11, 1.0, 2.0),
+            make_track(12, 8.0, 9.0),
+            make_track(13, 0.0, 9.0),
+        ]
+
+    @pytest.fixture
+    def index(self, tracks, diff):
+        return IdentityIndex(tracks, diff, 0.5)
+
+    def test_full_set_splits_into_three(self, index, tracks):
+        # 全片口径：0.9 那条离群边把 0/1/2 拆成两簇，加上 3 共三个角色。
+        assert index.count(tracks) == 3
+
+    def test_subset_merges(self, index, tracks):
+        # 只看窗口里的 0/1/3：离群边不在子集里，同一角色合成一簇。
+        assert index.count(tracks[:2] + tracks[3:]) == 2
+
+    def test_ignores_tracks_without_crops(self, index, tracks):
+        # 不在矩阵里的轨迹（没有代表裁剪图）不参与计数，与全片口径一致。
+        assert index.count(tracks + [make_track(99, 0.0, 1.0)]) == 3
+
+    def test_empty_subset(self, index):
+        assert index.count([]) == 0
+
+    def test_select_segments_uses_window_scope(self, tracks, diff):
+        # 全片聚类给出的 character_id 把窗口里那两条轨迹算成两个角色（拆过头），
+        # 窗口口径重聚类后只剩一个角色 + 轨迹 3，恰好卡在门槛 3 上下。
+        for track, cid in zip(tracks, [0, 0, 1, 2]):
+            track.character_id = cid
+        tracks[1].character_id = 1  # 模拟全片口径把 10/11 拆开
+        base = Config(window_seconds=5.0, frame_interval=1.0, min_events_per_window=3)
+        index = IdentityIndex(tracks, diff, 0.5)
+
+        video_scope = dataclasses.replace(base, cluster_scope="video")
+        segments, _ = select_segments(tracks, 5.0, video_scope, None, index)
+        assert segments and segments[0]["character_count"] == 3
+
+        window_scope = dataclasses.replace(base, cluster_scope="window")
+        segments, num_qualified = select_segments(tracks, 5.0, window_scope, None, index)
+        assert (segments, num_qualified) == ([], 0)
+
+    def test_window_scope_without_index_falls_back(self, tracks):
+        # 没有差异矩阵（没有任何代表裁剪图）时退回全片口径，不能崩。
+        for track, cid in zip(tracks, [0, 1, 2, 3]):
+            track.character_id = cid
+        config = Config(window_seconds=5.0, frame_interval=1.0,
+                        min_events_per_window=2, cluster_scope="window")
+        segments, _ = select_segments(tracks, 5.0, config, None, None)
+        assert segments and segments[0]["character_count"] == 3
