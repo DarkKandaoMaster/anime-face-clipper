@@ -1,10 +1,13 @@
 """动漫脸剪辑器的端到端流程。
 
-从动漫视频中找出并截取所有“合格”的 15 秒片段。当一个片段窗口内出现过
-至少 min_events_per_window 个不同角色时，该片段视为合格。一条轨迹由相邻
-帧中 IoU 重叠的人脸框串联而成（镜头切换会强制断开轨迹）；再用 CCIP 特征
+从视频中找出并截取所有“合格”的 window_seconds（30）秒片段。当一个片段窗口
+内出现过至少 min_events_per_window 个不同角色时，该片段视为合格。一条轨迹由
+相邻帧中 IoU 重叠的人脸框串联而成（镜头切换会强制断开轨迹）；再用身份特征
 对各轨迹的代表裁剪图聚类，得到轨迹级角色身份（character_id），同一角色的
 多条轨迹在窗口内只计一次。
+
+处理前先判画风（style.py），据此成套换上检测器、身份特征、阈值与过滤门槛
+（config.StyleProfile）：2D 走动漫脸 YOLO + CCIP，3D CG 与真人走 SCRFD + ArcFace。
 
 流式处理：帧由 cv2.VideoCapture 顺序解码，用完即弃，全程不落盘。整条流水线
 在内存中同时持有的图像只有“当前帧 + 每条活跃轨迹一张人脸裁剪图”，与视频
@@ -13,13 +16,13 @@
 
 从项目根目录运行：
 
-    python src/main.py                      # 处理 data/1.mp4 -> output/1/
-    python src/main.py data/1.mp4 --viz 8   # 同时导出带标注的示例帧
+    python src/main.py <video>              # 处理单个视频 -> output/<stem>/
+    python src/main.py <video> --viz 8      # 同时导出带标注的示例帧
 
 阶段（按下方分节注释组织）：
     解码抽帧 -> 检测 -> 过滤 -> 跟踪 -> 角色识别 -> 选段 -> 截取
 
-阈值敏感性：本流水线的输出对 ccip_threshold 与 min_events_per_window 高度
+阈值敏感性：本流水线的输出对 identity_threshold 与 min_events_per_window 高度
 敏感，两者会互相补偿（阈值调严 -> 同一角色被拆成多个 -> 角色数虚高 ->
 更容易越过 min_events 门槛）。在无逐窗口真值标注的情况下，单次运行的数字
 不构成对“真实角色数”的测量。定参数前请先用 sweep.py 扫一遍敏感性曲线。
@@ -45,12 +48,23 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
 from config import Config
-from detectors import Detection, Detector, count_eyes, get_detector
+from detectors import (
+    Detection,
+    Detector,
+    count_eyes,
+    crop_bbox,
+    expand_bbox,
+    get_detector,
+)
+from embedders import get_embedder
 from style import apply_style, classify_style
 
 # 重新导出，方便调用方使用 from src.main import Detection。
 # 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
-__all__ = ["Detection", "Track", "process_video", "run_pipeline", "main"]
+__all__ = [
+    "Detection", "Track", "crop_bbox", "expand_bbox",
+    "process_video", "run_pipeline", "main",
+]
 
 
 @dataclasses.dataclass
@@ -66,9 +80,12 @@ class Track:
         representative_frame: 最清晰检测结果所在的帧索引。
         representative_time: 该检测结果的时间戳。
         representative_bbox: 该检测结果的框（仅作溯源记录）。
-        representative_image: 跟踪时在线留存的 BGR 裁剪图；写盘后置 None。
-        representative_crop: 保存的裁剪图路径（相对于输出目录）。
-        character_id: CCIP 聚类得到的角色簇编号；None 表示身份未知
+        representative_images: 跟踪时在线留存的 BGR 裁剪图，按清晰度降序，
+            最多 config.crops_per_track 张；写盘后清空。
+        representative_crops: 保存的裁剪图路径（相对于输出目录），与上面同序。
+        representative_crop: 其中最清晰的那张（== representative_crops[0]），
+            聚类不用它，只是给人看和排查用。
+        character_id: 身份聚类得到的角色簇编号；None 表示身份未知
             （无代表裁剪图或读取失败），不参与窗口内的角色计数。
     """
 
@@ -80,7 +97,8 @@ class Track:
     representative_frame: int = -1
     representative_time: float = 0.0
     representative_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
-    representative_image: Optional[np.ndarray] = None
+    representative_images: List[np.ndarray] = dataclasses.field(default_factory=list)
+    representative_crops: List[str] = dataclasses.field(default_factory=list)
     representative_crop: str = ""
     character_id: Optional[int] = None
 
@@ -165,22 +183,8 @@ def imwrite_unicode(path: str, image_bgr: np.ndarray) -> bool:
 
 
 # === 3. 过滤 ===
-
-def crop_bbox(image_bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-    """按框裁出子图（拷贝一份，使其不再持有整帧的内存）。
-
-    框会先裁回画面边界内；空框/退化框返回 None。
-    """
-    x1, y1, x2, y2 = bbox
-    h, w = image_bgr.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1) # 把框裁回画面边界内
-    x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1: # 空框/退化框
-        return None
-    # copy() 是关键：numpy 切片是原帧的视图，留着它等于留着整帧不放，
-    # 流式处理的内存优势会被这一个引用全部抵消。
-    return image_bgr[y1:y2, x1:x2].copy()
-
+# crop_bbox / expand_bbox 定义在 detectors.py（裁剪口径和检测器绑死，
+# 真人检测器要用关键点对齐覆盖它），这里重新导出给测试和调用方。
 
 def laplacian_variance(crop_bgr: Optional[np.ndarray]) -> float:
     """裁剪图的拉普拉斯方差（聚焦/模糊度量）。
@@ -247,9 +251,10 @@ class FaceTracker:
     即使 IoU 很高也禁止跨越切换连接（带丢帧容忍的重连也不能跨越切换）。
 
     之所以做成在线的：代表裁剪图要挑“该轨迹内 blur_var * confidence 最大”
-    的那一张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那一帧，
-    流式下帧已经丢了。于是改为边跟踪边擂台——每条活跃轨迹只留当前最优的一张
-    裁剪图，来了更好的就换掉，内存占用与视频长度无关。
+    的那几张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那些帧，
+    流式下帧已经丢了。于是改为边跟踪边擂台——每条活跃轨迹只留当前最好的
+    config.crops_per_track 张裁剪图，来了更好的就挤掉最差的，内存占用与视频
+    长度无关。
     """
 
     def __init__(self, config: Config):
@@ -266,9 +271,12 @@ class FaceTracker:
             "last_index": index,
             "dets": [det],
             "blocked": False,
+            # 擂台榜：(score, crop) 按 score 降序，最多 crops_per_track 条。
+            "best": [],
+            # 榜首那张脸的位置信息。单独存是因为退化框（crop 为 None）也该留下
+            # 溯源记录，而它进不了擂台榜。
             "best_score": -1.0,
             "best_det": None,
-            "best_crop": None,
         }
         self._next_id += 1
         self._active.append(track)
@@ -280,7 +288,13 @@ class FaceTracker:
         if score > track["best_score"]:
             track["best_score"] = score
             track["best_det"] = det
-            track["best_crop"] = det.crop
+        board = track["best"]
+        if det.crop is not None and (
+            len(board) < self._config.crops_per_track or score > board[-1][0]
+        ):
+            board.append((score, det.crop))
+            board.sort(key=lambda item: item[0], reverse=True)
+            del board[self._config.crops_per_track:]  # 挤出榜的裁剪图在此失去引用
         det.crop = None  # 落选的裁剪图到此为止，不随 dets 列表一路累积
 
     def _finalize(self, track: Dict) -> None:
@@ -296,7 +310,7 @@ class FaceTracker:
                 representative_frame=best.frame_index if best else -1,
                 representative_time=best.time if best else 0.0,
                 representative_bbox=best.bbox if best else (0, 0, 0, 0),
-                representative_image=track["best_crop"],
+                representative_images=[crop for _score, crop in track["best"]],
             )
         )
 
@@ -393,13 +407,14 @@ def save_representatives(tracks: List[Track], crops_dir: str) -> None:
         shutil.rmtree(crops_dir)
     os.makedirs(crops_dir, exist_ok=True)
     for track in tracks:
-        image = track.representative_image
-        track.representative_image = None
-        if image is None:
-            continue
-        crop_name = f"track_{track.track_id}.jpg"
-        if imwrite_unicode(os.path.join(crops_dir, crop_name), image):
-            track.representative_crop = os.path.join("crops", crop_name)
+        images = track.representative_images
+        track.representative_images = []
+        for rank, image in enumerate(images):
+            crop_name = f"track_{track.track_id}_{rank}.jpg"
+            if imwrite_unicode(os.path.join(crops_dir, crop_name), image):
+                track.representative_crops.append(os.path.join("crops", crop_name))
+        if track.representative_crops:
+            track.representative_crop = track.representative_crops[0]
 
 
 # === 5. 角色识别 ===
@@ -443,56 +458,66 @@ def _cluster_by_difference(diff_matrix, threshold: float) -> List[int]:
     return labels
 
 
-def compute_ccip_differences(
+def compute_differences(
     tracks: List[Track],
     out_dir: str,
+    config: Config,
 ) -> Tuple[List[Track], Optional[np.ndarray]]:
-    """对有代表裁剪图的轨迹批量提取 CCIP 特征，返回两两差异矩阵。
+    """对有代表裁剪图的轨迹批量提取身份特征，返回两两差异矩阵。
 
     这是整个角色识别里唯一昂贵的一步（要跑 ONNX 推理），且结果与合并阈值
     无关，因此单独拆出来——阈值扫描可以只算一次、复用到所有阈值上。
 
-    返回：
-        (候选轨迹, N×N 差异矩阵)；没有候选轨迹时矩阵为 None。
-    """
-    # 延迟导入：CCIP 模型较重且首次使用需从 HuggingFace 下载，
-    from imgutils.metrics import ccip_batch_differences, ccip_batch_extract_features
+    用哪个特征由 ``config.embedder`` 决定（画风路由已经换好，见 embedders.py）。
 
+    一条轨迹可能有多张代表图（config.crops_per_track）。特征在**图**这一层
+    提取，再把 K×K 的子块取中位数聚合成轨迹间的一个差异值：中位数而不是最小值，
+    是因为最小值只要有一张脸偶然像另一个角色就会把两条轨迹粘起来，而
+    complete-linkage 的簇内约束会让这个错误继续扩散。
+
+    返回：
+        (候选轨迹, N×N 轨迹级差异矩阵)；没有候选轨迹时矩阵为 None。
+    """
     candidates: List[Track] = []
     crop_paths: List[str] = []
+    owners: List[int] = []  # 每张裁剪图属于第几条候选轨迹
     for track in tracks:
-        if not track.representative_crop:
+        paths = [
+            os.path.join(out_dir, rel) for rel in track.representative_crops
+            if os.path.isfile(os.path.join(out_dir, rel))
+        ]
+        if not paths:
             continue
-        crop_path = os.path.join(out_dir, track.representative_crop)
-        if not os.path.isfile(crop_path):
-            continue
+        owners.extend([len(candidates)] * len(paths))
         candidates.append(track)
-        crop_paths.append(crop_path)
+        crop_paths.extend(paths)
 
     if not candidates:
         return [], None
 
-    # 分批提取：一次性送入几百张图会让 ONNX 推理内存分配失败（bad allocation）。
-    batch_size = 32
-    feature_batches = [
-        ccip_batch_extract_features(crop_paths[i:i + batch_size])
-        for i in range(0, len(crop_paths), batch_size)
-    ]
-    features = np.concatenate(feature_batches)
-    return candidates, ccip_batch_differences(features)
+    crop_diff = get_embedder(config.embedder).differences(crop_paths)
+    if len(crop_paths) == len(candidates):  # 每条轨迹一张图，无需聚合
+        return candidates, crop_diff
+
+    owners = np.asarray(owners)
+    groups = [np.flatnonzero(owners == i) for i in range(len(candidates))]
+    track_diff = np.zeros((len(candidates), len(candidates)), dtype=float)
+    for i, rows in enumerate(groups):
+        for j, cols in enumerate(groups[:i]):
+            value = float(np.median(crop_diff[np.ix_(rows, cols)]))
+            track_diff[i, j] = track_diff[j, i] = value
+    return candidates, track_diff
 
 
-def resolve_ccip_threshold(config: Config) -> float:
-    """取 config.ccip_threshold；为 None 时用 imgutils 的默认阈值（约 0.178）。"""
-    if config.ccip_threshold is not None:
-        return config.ccip_threshold
-    from imgutils.metrics import ccip_default_threshold
-
-    return ccip_default_threshold()
+def resolve_identity_threshold(config: Config) -> float:
+    """取 config.identity_threshold；为 None 时用该 embedder 自带的默认阈值。"""
+    if config.identity_threshold is not None:
+        return config.identity_threshold
+    return get_embedder(config.embedder).default_threshold()
 
 
 def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
-    """用 CCIP 对轨迹代表裁剪图聚类，给每条轨迹写入 character_id。
+    """对轨迹代表裁剪图聚类，给每条轨迹写入 character_id。
 
     对候选轨迹的差异矩阵做 complete-linkage 层次聚类（簇内任意两张裁剪图
     差异都 < 阈值），同一簇视为同一角色。无裁剪图（或文件缺失）的轨迹保持
@@ -501,10 +526,10 @@ def assign_characters(tracks: List[Track], out_dir: str, config: Config) -> int:
     返回：
         识别出的不同角色总数。
     """
-    candidates, diff_matrix = compute_ccip_differences(tracks, out_dir)
+    candidates, diff_matrix = compute_differences(tracks, out_dir, config)
     if diff_matrix is None:
         return 0
-    cluster_ids = _cluster_by_difference(diff_matrix, resolve_ccip_threshold(config))
+    cluster_ids = _cluster_by_difference(diff_matrix, resolve_identity_threshold(config))
     for track, cluster_id in zip(candidates, cluster_ids):
         track.character_id = cluster_id
     return len(set(cluster_ids))
@@ -754,7 +779,7 @@ def _track_record(track: Track) -> Dict:
         "representative_frame": track.representative_frame,
         "representative_time": round(track.representative_time, 3),
         "representative_bbox": list(track.representative_bbox),
-        "representative_crop": track.representative_crop,
+        "representative_crops": track.representative_crops,
         "character_id": track.character_id,
     }
 
@@ -858,10 +883,15 @@ def scan_video(
         kept = []
         for det in raw:
             det.crop = crop_bbox(image, det.bbox) # 当帧就地裁下来，帧一丢就没有第二次机会
-            det.blur_var = laplacian_variance(det.crop) # 计算清晰度
+            det.blur_var = laplacian_variance(det.crop) # 计算清晰度（按紧贴人脸框算）
             # 先过三道便宜门槛，再对幸存者跑眼睛检测（正脸判定），避免给注定
             # 被刷掉的脸白跑一次推理。
-            ok = passes_quality(det, frame_h, config) and passes_frontal(det, config)
+            ok = passes_quality(det, frame_h, config)
+            if ok:
+                # 幸存者才换成检测器指定口径的代表裁剪图（动漫脸外扩带上发型、
+                # 真人脸按关键点对齐）；注定被刷掉的脸不值得多跑一次。
+                det.crop = detector.make_crop(image, det)
+            ok = ok and passes_frontal(det, config)
             detection_records.append(_detection_record(det, ok))
             if ok:
                 kept.append(det)
@@ -902,7 +932,6 @@ def process_video(
     config: Config,
     video_path: str,
     output_root: str,
-    detector: Optional[Detector] = None,
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
 ) -> Dict:
@@ -912,29 +941,29 @@ def process_video(
         config: 流程配置。
         video_path: 源视频路径。
         output_root: 基础输出目录；结果会写入 <root>/<stem>/。
-        detector: 共享检测器实例（为 None 时创建）。传入该实例可让批处理复用
-            同一个已加载模型。
         limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
         viz_count: 随机导出的标注示例帧数量。
 
     返回：
         摘要字典（也会持久化到 JSON 文件中）。
     """
-    if detector is None:
-        detector = get_detector(config.detector, config)
-    _report_providers(detector)
-
     stem = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = os.path.join(output_root, stem)
     os.makedirs(out_dir, exist_ok=True)
 
-    # 画风路由：先判 2D / 非 2D，再据此换掉 ccip_threshold。必须在扫描之前做，
-    # 因为路由后的 config 要一路带到聚类阶段。
+    # 画风路由：先判 2D / 非 2D，再据此换上整套识别参数。必须在扫描之前做，
+    # 因为路由后的 config 决定用哪个检测器、怎么裁剪，一路带到聚类阶段。
     style = "-"
     if config.style_routing:
         style, votes = classify_style(video_path, config)
         config = apply_style(config, style)
-        print(f"[{stem}] style={style} {votes} -> ccip_threshold={resolve_ccip_threshold(config)}")
+        print(f"[{stem}] style={style} {votes} -> {config.detector} + "
+              f"{config.embedder}@{resolve_identity_threshold(config)}")
+
+    # 检测器实例按名字在进程内复用（get_detector 内部缓存），批量处理时
+    # 同画风的视频不会重复加载模型。
+    detector = get_detector(config.detector, config)
+    _report_providers(detector)
 
     tracks, detection_records, duration, num_frames, cuts = scan_video(
         config, video_path, out_dir, detector, limit_seconds, viz_count
@@ -998,16 +1027,13 @@ def run_pipeline(
 ) -> List[Dict]:
     """处理一个或多个视频，并复用单个已加载的检测器。
 
-    v1 中的批处理支持有意保持最小化：这里保留循环和共享检测器，
-    CLI 只传入单个视频。
+    检测器与身份特征模型都在各自的注册表里按名字缓存，所以多个视频之间
+    自动复用同一份已加载模型，即使它们被路由到不同画风。
     """
-    detector = get_detector(config.detector, config)
-    summaries = []
-    for video_path in video_paths:
-        summaries.append(
-            process_video(config, video_path, output_root, detector=detector, **kwargs)
-        )
-    return summaries
+    return [
+        process_video(config, video_path, output_root, **kwargs)
+        for video_path in video_paths
+    ]
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1020,12 +1046,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conf", type=float, help="Override conf_threshold.") # 置信度阈值（默认 0.5）。调高更严格：误检少、漏检多。
     parser.add_argument("--blur-var", type=float, help="Override blur_var_threshold.") # 模糊过滤的拉普拉斯方差下限（默认 50.0）。调高丢弃更多模糊/拖影脸。
     parser.add_argument("--scdet-threshold", type=float, help="Override scdet_threshold (0-100); lower detects more cuts.") # ffmpeg scdet 阈值（默认 10.0）。调低检测到的切换更多；CG 动作素材建议 5。
-    parser.add_argument("--min-events", type=int, help="Override min_events_per_window.") # 窗口内所需不同角色数（默认 13）。调低则更多片段合格、出片更多。
-    parser.add_argument("--ccip-threshold", type=float, help="Override ccip_threshold.") # CCIP 角色合并阈值（默认用模型自带阈值 ≈0.178）。调高更容易把不同轨迹合并为同一角色。
+    parser.add_argument("--min-events", type=int, help="Override min_events_per_window.") # 窗口内所需不同角色数（默认 4）。调低则更多片段合格、出片更多。
+    parser.add_argument("--identity-threshold", type=float, help="Override identity_threshold.") # 身份合并阈值。调高更容易把不同轨迹合并为同一角色。跨 embedder 不可比（CCIP ≈0.178，ArcFace ≈0.6）。
+    parser.add_argument("--crop-margin", type=float, help="Override crop_margin.") # 代表裁剪图相对人脸框的外扩比例。CCIP 靠它把发型带进特征；ArcFace 走关键点对齐，不受影响。
     parser.add_argument("--frame-interval", type=float, help="Override frame_interval.") # 抽帧间隔秒数（默认 0.3）。调小则采样更密、更慢更准。
     parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).") # 视频编码器（默认 h264_nvenc）。失败会自动回退到 libx264；无 GPU 时显式传 libx264。
-    parser.add_argument("--no-eyes", action="store_true", help="Disable frontal-face (two-eye) filter.") # 关掉正脸过滤。开着（默认）会丢掉侧脸/背身，跨镜头去重更准但召回更低。
-    parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one ccip_threshold for all.") # 关掉画风路由，所有素材共用 config.ccip_threshold。
+    parser.add_argument("--eyes", type=int, metavar="N", help="Require N eyes per face (frontal filter). 0 = off (default).") # 正脸过滤：脸上至少检出 N 只眼才保留。默认 0（关）——实测有害，见 README 第六之二节；传 2 可复现那组对照。
+    parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one detector/embedder/threshold for all.") # 关掉画风路由，所有素材共用 config 里的 detector / embedder / identity_threshold。
     # 运行 / 调试参数。
     parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
     parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.") # 导出 N 张带标注的样本帧（蓄水池采样，均匀分布于全片），用于肉眼检查检测/过滤效果（默认 0，不导出）。
@@ -1046,14 +1073,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.scdet_threshold = args.scdet_threshold
     if args.min_events is not None:
         config.min_events_per_window = args.min_events
-    if args.ccip_threshold is not None:
-        config.ccip_threshold = args.ccip_threshold
+    if args.identity_threshold is not None:
+        config.identity_threshold = args.identity_threshold
+    if args.crop_margin is not None:
+        config.crop_margin = args.crop_margin
     if args.frame_interval is not None:
         config.frame_interval = args.frame_interval
     if args.encoder is not None:
         config.encoder = args.encoder
-    if args.no_eyes:
-        config.require_eyes = 0
+    if args.eyes is not None:
+        config.require_eyes = args.eyes
     if args.no_style_routing:
         config.style_routing = False
 

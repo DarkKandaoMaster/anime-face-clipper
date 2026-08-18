@@ -1,5 +1,6 @@
 onnxruntime-gpu==1.18.1 --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/ # CUDA 11.8 + cuDNN 8.x 构建。cuDNN 9 会报 error 126
 # onnxruntime-gpu==1.18.1 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/ # 听说使用这句代码而不是上句代码安装时可以同时安装opencv/imgutils
-dghs-imgutils             # 动漫脸检测 (YOLOv8)
-opencv-python             # 抽帧后处理 / 模糊度 (Laplacian) 计算
+dghs-imgutils             # 动漫脸检测 (YOLOv8)、CCIP 角色相似度、画风分类
+huggingface-hub           # 拉 InsightFace 的 SCRFD / ArcFace onnx（真人与 3D CG 分支）
+opencv-python             # 抽帧后处理 / 模糊度 (Laplacian) / SCRFD 前后处理与人脸对齐
 scipy                     # complete-linkage 层次聚类（角色识别）

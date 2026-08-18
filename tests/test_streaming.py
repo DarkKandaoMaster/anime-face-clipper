@@ -206,7 +206,7 @@ class TestFaceTrackerRepresentative:
         assert len(tracks) == 1
         assert tracks[0].representative_frame == 1
         assert tracks[0].representative_time == pytest.approx(0.3)
-        assert np.array_equal(tracks[0].representative_image, best_crop)
+        assert np.array_equal(tracks[0].representative_images[0], best_crop)
 
     def test_losing_crops_are_released(self, config):
         # 落选裁剪图必须立刻解引用，否则会随 dets 列表一路累积到轨迹结束。
@@ -221,6 +221,30 @@ class TestFaceTrackerRepresentative:
         assert dets[0].crop is None  # 胜出者的图已转移到轨迹上
         assert dets[1].crop is None  # 落选者的图已丢弃
 
+    def test_board_keeps_top_k_by_score(self):
+        # 擂台榜留 crops_per_track 张，按 blur_var * confidence 降序，多的挤掉。
+        config = Config(crops_per_track=2, frame_interval=0.3)
+        crops = [np.full((4, 4, 3), i, dtype=np.uint8) for i in range(1, 5)]
+        tracker = FaceTracker(config)
+        for i, (blur, crop) in enumerate(zip([10.0, 90.0, 50.0, 1.0], crops)):
+            tracker.update(i, False,
+                           [make_det(i, i * 0.3, (0, 0, 100, 100), 1.0, blur, crop)])
+        images = tracker.finish()[0].representative_images
+        assert len(images) == 2
+        assert np.array_equal(images[0], crops[1])  # blur 90
+        assert np.array_equal(images[1], crops[2])  # blur 50
+
+    def test_board_of_one_matches_single_representative(self):
+        # crops_per_track=1 时退化成"只留最清晰那张"，与多图版本的榜首一致。
+        config = Config(crops_per_track=1, frame_interval=0.3)
+        crops = [np.full((4, 4, 3), i, dtype=np.uint8) for i in range(1, 3)]
+        tracker = FaceTracker(config)
+        tracker.update(0, False, [make_det(0, 0.0, (0, 0, 100, 100), 1.0, 10.0, crops[0])])
+        tracker.update(1, False, [make_det(1, 0.3, (0, 0, 100, 100), 1.0, 90.0, crops[1])])
+        images = tracker.finish()[0].representative_images
+        assert len(images) == 1
+        assert np.array_equal(images[0], crops[1])
+
     def test_each_track_keeps_its_own_crop(self, config):
         left = np.full((4, 4, 3), 1, dtype=np.uint8)
         right = np.full((4, 4, 3), 2, dtype=np.uint8)
@@ -231,7 +255,7 @@ class TestFaceTrackerRepresentative:
         ])
         tracks = tracker.finish()
         assert len(tracks) == 2
-        images = [t.representative_image for t in tracks]
+        images = [t.representative_images[0] for t in tracks]
         assert any(np.array_equal(im, left) for im in images)
         assert any(np.array_equal(im, right) for im in images)
 
@@ -244,15 +268,15 @@ class TestFaceTrackerRepresentative:
         tracker.update(1, True, [make_det(1, 0.3, (0, 0, 100, 100), 0.9, 99.0, second)])
         tracks = tracker.finish()
         assert len(tracks) == 2
-        assert np.array_equal(tracks[0].representative_image, first)
-        assert np.array_equal(tracks[1].representative_image, second)
+        assert np.array_equal(tracks[0].representative_images[0], first)
+        assert np.array_equal(tracks[1].representative_images[0], second)
 
     def test_no_crop_still_records_representative_position(self, config):
         # 裁剪图为 None（退化框）时轨迹仍然成立，只是没有图可聚类。
         tracker = FaceTracker(config)
         tracker.update(0, False, [make_det(0, 0.0, (0, 0, 100, 100), 0.9, 5.0, None)])
         tracks = tracker.finish()
-        assert tracks[0].representative_image is None
+        assert tracks[0].representative_images == []
         assert tracks[0].representative_frame == 0
 
     def test_finish_is_idempotent(self, config):

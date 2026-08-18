@@ -24,7 +24,7 @@
 
     $py = "D:\\Programs\\DevEnvironments\\Anaconda\\anaconda3\\envs\\myenv\\python.exe"
     & $py src/evaluate.py data/*.mp4                    # 用 config 当前参数（含画风路由）
-    & $py src/evaluate.py data/*.mp4 --ccip 0.05,0.1,0.178,0.25   # 按阈值网格扫召回
+    & $py src/evaluate.py data/*.mp4 --threshold 0.05,0.1,0.178,0.25   # 按阈值网格扫召回
     & $py src/evaluate.py data/*.mp4 --eyes 2           # 打开正脸过滤做对照（默认关）
 
 产出：控制台表格 + <output-dir>/recall.csv（每次重跑覆盖，幂等）。
@@ -43,10 +43,10 @@ from config import Config
 from groundtruth import GroundTruth, parse_ground_truth
 from main import (
     _cluster_by_difference,
-    compute_ccip_differences,
+    compute_differences,
     force_utf8_stdout,
     get_detector,
-    resolve_ccip_threshold,
+    resolve_identity_threshold,
     scan_video,
 )
 from style import apply_style, classify_style
@@ -97,7 +97,7 @@ def evaluate_one(
     gt: GroundTruth,
     tracks,
     cuts: List[float],
-    ccip_threshold: float,
+    identity_threshold: float,
 ) -> Dict:
     """给定一组已聚类的轨迹，算出这一格的全部指标。"""
     pred_characters = len({t.character_id for t in tracks if t.character_id is not None})
@@ -108,7 +108,7 @@ def evaluate_one(
         # 用「标题_源片位置」当短名，完整文件名（带标注）在表里太长，读不了。
         "video": f"{gt.title}_{gt.source_offset}s",
         "style_gt": gt.style,
-        "ccip": ccip_threshold,
+        "threshold": identity_threshold,
         "tracks": len(tracks),
         # 主指标：跨镜头去重后的角色数
         "gt_chars": gt.num_characters,
@@ -136,12 +136,14 @@ def evaluate_video(
     config: Config,
     video_path: str,
     output_root: str,
-    detector,
-    ccip_values: Optional[List[float]],
+    threshold_values: Optional[List[float]],
 ) -> List[Dict]:
-    """扫描一段素材，在给定的 CCIP 阈值上各算一行召回。
+    """扫描一段素材，在给定的身份阈值上各算一行召回。
 
-    ``ccip_values`` 为 None 时只跑一格：由画风路由（或 config 默认值）定出的阈值。
+    ``threshold_values`` 为 None 时只跑一格：由画风路由（或 config 默认值）定出的阈值。
+
+    注意阈值网格**跨 embedder 不可比**：2D 走 CCIP（同人差异 ≈0.1~0.2），
+    非 2D 走 ArcFace（≈0.4~0.8）。扫网格时看分风格那几列，别看全局那行。
     """
     gt = parse_ground_truth(video_path)
     if gt is None:
@@ -154,35 +156,34 @@ def evaluate_video(
     style_pred, votes = "-", {}
     if config.style_routing:
         style_pred, votes = classify_style(video_path, config)
-        print(f"[{gt.stem[:20]}] 画风判别：{style_pred}（真值 {gt.style}，票数 {votes}）")
+        config = apply_style(config, style_pred)
+        print(f"[{gt.stem[:20]}] 画风判别：{style_pred}（真值 {gt.style}，票数 {votes}）"
+              f" -> {config.detector} + {config.embedder}")
 
+    detector = get_detector(config.detector, config)
     tracks, _detections, _duration, num_frames, cuts = scan_video(
         config, video_path, out_dir, detector
     )
-    candidates, diff_matrix = compute_ccip_differences(tracks, out_dir)
+    candidates, diff_matrix = compute_differences(tracks, out_dir, config)
     if diff_matrix is None:
         print(f"[{gt.stem[:20]}] 没有任何代表裁剪图，全部角色都漏了。")
         return [
             {
-                **evaluate_one(gt, tracks, cuts, ccip or 0.0),
+                **evaluate_one(gt, tracks, cuts, threshold or 0.0),
                 "style_pred": style_pred,
             }
-            for ccip in (ccip_values or [None])
+            for threshold in (threshold_values or [None])
         ]
     print(f"[{gt.stem[:20]}] {num_frames} 帧，{len(tracks)} 条轨迹，{len(candidates)} 条参与聚类")
 
-    if ccip_values is None:
-        routed = apply_style(config, style_pred) if config.style_routing else config
-        grid = [resolve_ccip_threshold(routed)]
-    else:
-        grid = ccip_values
+    grid = threshold_values or [resolve_identity_threshold(config)]
 
     rows = []
-    for ccip in grid:
-        labels = _cluster_by_difference(diff_matrix, ccip)
+    for threshold in grid:
+        labels = _cluster_by_difference(diff_matrix, threshold)
         for track, label in zip(candidates, labels):
             track.character_id = label
-        row = evaluate_one(gt, tracks, cuts, ccip)
+        row = evaluate_one(gt, tracks, cuts, threshold)
         row["style_pred"] = style_pred
         rows.append(row)
     return rows
@@ -192,14 +193,15 @@ def evaluate_video(
 
 _COLUMNS = [
     ("video", 20, "s"), ("style_gt", 9, "s"), ("style_pred", 11, "s"),
-    ("ccip", 7, ".3f"), ("gt_chars", 9, "d"), ("pred_chars", 11, "d"),
+    ("thresh", 7, ".3f"), ("gt_chars", 9, "d"), ("pred_chars", 11, "d"),
     ("recall", 8, ".2f"), ("ratio", 7, ".2f"), ("f1", 6, ".2f"),
     ("gt_shots", 9, "d"), ("pred_shots", 11, "d"),
     ("gt_faces", 9, "d"), ("pred_faces", 11, "d"), ("rec_faces", 10, ".2f"),
 ]
 # 表头短名 -> 行里的字段名（表头要短才排得下，字段名要长才自解释）。
 _HEADER_TO_FIELD = {"recall": "recall_chars", "ratio": "ratio_chars",
-                    "f1": "f1_chars", "rec_faces": "recall_faces"}
+                    "f1": "f1_chars", "rec_faces": "recall_faces",
+                    "thresh": "threshold"}
 
 
 def _width(text: str) -> int:
@@ -233,25 +235,28 @@ def print_table(rows: List[Dict]) -> None:
         ))
 
 
-def print_summary(rows: List[Dict], ccip_values: Optional[List[float]]) -> None:
-    """按 CCIP 阈值 × 画风汇总召回。
+def print_summary(rows: List[Dict], threshold_values: Optional[List[float]]) -> None:
+    """按身份阈值 × 画风汇总召回。
 
     micro = 全部素材的 min(pred,gt) 之和 / 真值之和（大素材权重更大）；
     macro = 各素材召回的算术平均（每段素材等权，9 段样本下这个更有代表性）。
+
+    开着画风路由扫网格时，2D 与非 2D 用的是不同的 embedder，阈值不在同一
+    尺度上——只有分风格那几列有意义，全局 macro 那几列没有。
     """
-    thresholds = sorted({r["ccip"] for r in rows})
+    thresholds = sorted({r["threshold"] for r in rows})
     styles = ["2d", "3d", "real"]
 
-    print("\n=== 角色召回率汇总（按 ccip_threshold）===")
+    print("\n=== 角色召回率汇总（按 identity_threshold）===")
     print("列：macro/micro 召回，过检段数，F1（选阈值看这个），以及分风格的召回 | F1")
-    cols = [("ccip", 7), ("macro", 8), ("micro", 8), ("过检段数", 10),
+    cols = [("thresh", 7), ("macro", 8), ("micro", 8), ("过检段数", 10),
             ("macroF1", 9)] + [(s, 14) for s in styles]
     header = "".join(_pad(name, w) for name, w in cols)
     print(header)
     print("-" * _width(header))
     best = None
-    for ccip in thresholds:
-        subset = [r for r in rows if r["ccip"] == ccip]
+    for threshold in thresholds:
+        subset = [r for r in rows if r["threshold"] == threshold]
         macro = sum(r["recall_chars"] for r in subset) / len(subset)
         micro = sum(min(r["pred_chars"], r["gt_chars"]) for r in subset) / sum(
             r["gt_chars"] for r in subset
@@ -261,8 +266,8 @@ def print_summary(rows: List[Dict], ccip_values: Optional[List[float]]) -> None:
         # 这件事，必须单列一栏，否则"把一个角色拆成十个"会显示成满分。
         over = sum(1 for r in subset if r["pred_chars"] > r["gt_chars"])
         if best is None or macro_f1 > best[1]:
-            best = (ccip, macro_f1)
-        cells = [_pad(f"{ccip:.3f}", 7), _pad(f"{macro:.2f}", 8),
+            best = (threshold, macro_f1)
+        cells = [_pad(f"{threshold:.3f}", 7), _pad(f"{macro:.2f}", 8),
                  _pad(f"{micro:.2f}", 8), _pad(str(over), 10),
                  _pad(f"{macro_f1:.2f}", 9)]
         for style in styles:
@@ -274,30 +279,25 @@ def print_summary(rows: List[Dict], ccip_values: Optional[List[float]]) -> None:
         print("".join(cells))
 
     if len(thresholds) > 1:
-        print(f"\n全局最佳（按 macroF1）：ccip={best[0]:.3f}，macroF1={best[1]:.2f}")
+        print(f"\n全局最佳（按 macroF1）：threshold={best[0]:.3f}，macroF1={best[1]:.2f}")
         # 分风格各自挑最佳阈值——这正是画风路由存在的理由，两者不同才说明路由有用。
         for style in styles:
-            per_ccip = []
-            for ccip in thresholds:
-                group = [r for r in rows if r["ccip"] == ccip and r["style_gt"] == style]
+            per_threshold = []
+            for threshold in thresholds:
+                group = [r for r in rows if r["threshold"] == threshold and r["style_gt"] == style]
                 if group:
-                    per_ccip.append((sum(r["f1_chars"] for r in group) / len(group), ccip))
-            if per_ccip:
-                f1, ccip = max(per_ccip)
-                print(f"  {style:>5} 最佳 ccip={ccip:.3f}（F1={f1:.2f}）")
+                    per_threshold.append((sum(r["f1_chars"] for r in group) / len(group), threshold))
+            if per_threshold:
+                f1, threshold = max(per_threshold)
+                print(f"  {style:>5} 最佳 threshold={threshold:.3f}（F1={f1:.2f}）")
 
-    if ccip_values is None:
+    if threshold_values is None:
         print("\n（以上只有一行：用的是 config 当前参数 + 画风路由后的阈值，不是网格扫描。）")
 
     routed = [r for r in rows if r.get("style_pred") not in (None, "-")]
     if routed:
-        # 真值是三分类（real / 2d / 3d），路由是二分类（2d / non_2d）——
-        # 真人与 3D 共用一套参数，所以这里把真值折叠成同样的二分再比。
-        correct = sum(
-            1 for r in routed
-            if r["style_pred"] == ("2d" if r["style_gt"] == "2d" else "non_2d")
-        )
-        print(f"\n画风路由准确率：{correct}/{len(routed)}（真值三分类折叠成 2d / non_2d 后比对）")
+        correct = sum(1 for r in routed if r["style_pred"] == r["style_gt"])
+        print(f"\n画风路由准确率：{correct}/{len(routed)}（2d / 3d / real 三分类）")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -308,10 +308,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("videos", nargs="+", help="输入视频路径。")
     parser.add_argument("--output-dir", default="output", help="输出根目录。")
     parser.add_argument(
-        "--ccip",
-        help="逗号分隔的 CCIP 阈值网格。不填则只跑一格（config 参数 + 画风路由）。",
+        "--threshold",
+        help="逗号分隔的身份阈值网格。不填则只跑一格（config 参数 + 画风路由）。"
+             "跨 embedder 不可比：CCIP ≈0.1~0.2，ArcFace ≈0.4~0.8。",
     )
     parser.add_argument("--frame-interval", type=float, help="覆盖抽帧间隔。")
+    # 下面这几个覆盖项配合 --no-style-routing 使用：关掉路由后，就能把同一套
+    # 检测器/特征/门槛压到全部 9 段素材上跑对照，再看分风格那几列。
+    # 路由开着时它们会被 profile 覆盖掉（profile 是成套的，见 config.StyleProfile）。
+    parser.add_argument("--crop-margin", type=float, help="覆盖代表裁剪图外扩比例。")
+    parser.add_argument("--detector", help="覆盖检测器名。")
+    parser.add_argument("--embedder", help="覆盖身份特征名。")
+    parser.add_argument("--min-face-height", type=float, help="覆盖人脸高度占比下限。")
     parser.add_argument(
         "--eyes", type=int, metavar="N",
         help="覆盖正脸过滤门槛（人脸上至少 N 只眼）。默认 0=关闭；传 2 可复现对照实验。",
@@ -324,18 +332,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     config = Config()
     if args.frame_interval is not None:
         config.frame_interval = args.frame_interval
+    if args.crop_margin is not None:
+        config.crop_margin = args.crop_margin
+    if args.detector is not None:
+        config.detector = args.detector
+    if args.embedder is not None:
+        config.embedder = args.embedder
+    if args.min_face_height is not None:
+        config.min_face_height_ratio = args.min_face_height
     if args.eyes is not None:
         config.require_eyes = args.eyes
     if args.no_style_routing:
         config.style_routing = False
 
-    ccip_values = _parse_floats(args.ccip) if args.ccip else None
+    threshold_values = _parse_floats(args.threshold) if args.threshold else None
 
-    detector = get_detector(config.detector, config)
     rows: List[Dict] = []
     for video_path in args.videos:
         rows.extend(
-            evaluate_video(config, video_path, args.output_dir, detector, ccip_values)
+            evaluate_video(config, video_path, args.output_dir, threshold_values)
         )
 
     if not rows:
@@ -343,7 +358,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     print_table(rows)
-    print_summary(rows, ccip_values)
+    print_summary(rows, threshold_values)
 
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, "recall.csv")

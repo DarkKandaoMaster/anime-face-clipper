@@ -10,9 +10,19 @@
 
 它是 `自动化识别项目不可行性说明.docx`（仓库根目录，git 忽略）里被判"技术不可达"的那个需求的**简化实现**：判断视频中是否存在**时长 ≤30 秒、出镜主体达到 X 人**的片段。该项目已重启，方向是**做一个粗糙、但能拿人工标注量化召回率的版本**，而不是重新论证不可行。
 
-不可行性说明里的实测走的是**行人 ReID**（OSNet / OSNet-IBN / PersonViT）；本仓库走的是**动漫脸检测 + CCIP 角色相似度**，是另一条路线。
+不可行性说明里的实测走的是**行人 ReID**（OSNet / OSNet-IBN / PersonViT）；本仓库走的是**人脸检测 + 人脸/角色身份特征**，是另一条路线。
 
-判定标准：一个 `window_seconds` 窗口里如果**出现过 ≥ `min_events_per_window` 个不同角色**，就算合格片段。角色身份由 CCIP（动漫角色相似度模型）对轨迹代表裁剪图做 complete-linkage 层次聚类得到；"出现过"指轨迹时间区间与窗口相交（包括窗口开始前就在画面中的角色），同一角色的多条轨迹只计一次。
+判定标准：一个 `window_seconds` 窗口里如果**出现过 ≥ `min_events_per_window` 个不同角色**，就算合格片段。角色身份由身份特征模型对轨迹代表裁剪图做 complete-linkage 层次聚类得到；"出现过"指轨迹时间区间与窗口相交（包括窗口开始前就在画面中的角色），同一角色的多条轨迹只计一次。
+
+**按画风分三条支路**（[`style.py`](./src/style.py) 抽 8 帧判定，实测 9/9 判对），每条支路是一整套绑死的参数（[`config.StyleProfile`](./src/config.py)）：
+
+| 画风 | 检测器 | 身份特征 | 代表裁剪图 | 身份阈值 | 人脸高度下限 |
+|---|---|---|---|---:|---:|
+| 2D 手绘 | 动漫脸 YOLOv8（imgutils） | CCIP | 人脸框**外扩 0.6 倍** | 0.20 | 0.03 |
+| 3D CG | InsightFace SCRFD-10G | ArcFace `w600k_r50` | 五点关键点**仿射对齐** 112×112 | 0.85 | 0.045 |
+| 真人实拍 | InsightFace SCRFD-10G | ArcFace `w600k_r50` | 同上 | 0.85 | **0.09** |
+
+这四项必须成套换，拆开就会拼出无意义的组合：ArcFace 只在对齐脸上成立，CCIP 只在动漫角色图上成立，SCRFD 的框比动漫框矮一大截所以尺寸门槛不通用。
 
 入口链路（见 [`src/main.py`](./src/main.py)）：
 
@@ -27,7 +37,7 @@ main()  →  run_pipeline()  →  process_video()  →  scan_video()   ← 唯�
 流式解码 → 检测 → 过滤 → 跟踪 → 角色识别 → 选段 → 截取
 ```
 
-**流式处理**：帧由 `cv2.VideoCapture` 顺序解码，用完即弃，**全程不落盘**。内存中同时存在的图像只有"当前帧 + 每条活跃轨迹一张人脸裁剪图"，与视频长度无关（实测帧数 ×6 峰值内存仅 +3%）。
+**流式处理**：帧由 `cv2.VideoCapture` 顺序解码，用完即弃，**全程不落盘**。内存中同时存在的图像只有"当前帧 + 每条活跃轨迹一张人脸裁剪图"，与视频长度无关（实测帧数 ×6 峰值内存仅 +3%）。由此产生一条硬约束：**任何需要回看某一帧像素的处理，都必须在检测的当帧算完、结果挂在 `Detection` 上带下去**——裁剪、关键点对齐、清晰度、眼睛数都是这么做的。
 
 ### 重启后改造的落地情况（2026-08-18）
 
@@ -35,9 +45,10 @@ main()  →  run_pipeline()  →  process_video()  →  scan_video()   ← 唯�
 |---|---|---|
 | 窗口长度 | `window_seconds = 15.0` | **30 秒**（需求口径就是 30 秒窗口，不再当可调参数） |
 | 合格门槛 | `min_events_per_window = 13` | **4**（9 段素材真值落在 4~11，取下界） |
-| 画风 | 单一模型 + 单套参数 | [`style.py`](./src/style.py) 抽 8 帧投票判 2D / 非 2D，路由 `ccip_threshold`。**9/9 判对** |
+| 画风 | 单一模型 + 单套参数 | [`style.py`](./src/style.py) 抽 8 帧判 **2D / 3D CG / 真人** 三分类，整套换模型与参数。**9/9 判对** |
+| 真人 / 3D CG | 也用动漫脸 YOLO + CCIP（离分布） | **SCRFD-10G + ArcFace**，按关键点对齐 |
 | 正脸 | 不判断 | 已实现（`require_eyes`），但**实测有害，默认关闭**——见第六节 A/B |
-| 验收 | 无 | [`evaluate.py`](./src/evaluate.py) 用文件名标注算召回，**macro 召回 0.96、macro F1 0.90** |
+| 验收 | 无 | [`evaluate.py`](./src/evaluate.py) 用文件名标注算召回，**macro 召回 0.98、macro F1 0.96** |
 
 下面第二~八节描述的是当前代码的行为；剩下的长期方向在第九节。
 
@@ -78,10 +89,11 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 & $py src/main.py "data/魔女之旅_760s（人脸数期望：2+5+1+0+3+1）（跨镜头身份去重后期望：9）.mp4" --min-events 5
 & $py src/main.py <video> --limit-seconds 60 --viz 8   # 调参：只跑前 60 秒 + 导出 8 张标注帧
 & $py src/sweep.py data/*.mp4                          # 阈值敏感性网格扫描 → output/sweep.csv
-& $py -m pytest tests -q                               # 82 个纯逻辑单测，约 1.7 秒，不需要 GPU / 模型 / 网络
+& $py src/evaluate.py data/*.mp4                       # 召回率评估 → output/recall.csv
+& $py -m pytest tests -q                               # 118 个纯逻辑单测，约 2 秒，不需要 GPU / 模型 / 网络
 ```
 
-模型（`deepghs/anime_face_detection` 的 `face_detect_v1.4_s`、`deepghs/ccip_onnx`）已缓存在 `~/.cache/huggingface/hub`。加 `$env:HF_HUB_OFFLINE = '1'` 可完全跳过网络（imgutils 每个新进程首次检测都会联网列一次模型清单），实测能跑通全流程。若遇到 `SSL: UNEXPECTED_EOF_WHILE_READING`（系统代理开启时会这样），再补 `$env:HF_ENDPOINT = 'https://hf-mirror.com'; $env:NO_PROXY = '*'`。
+模型全部走 HuggingFace 缓存（`~/.cache/huggingface/hub`），清单见第八节末。**首次运行需要联网**下载真人支路的 SCRFD + ArcFace；下完之后加 `$env:HF_HUB_OFFLINE = '1'` 可完全跳过网络（imgutils 每个新进程首次检测都会联网列一次模型清单），实测能跑通全流程。若遇到 `SSL: UNEXPECTED_EOF_WHILE_READING`（系统代理开启时会这样），再补 `$env:HF_ENDPOINT = 'https://hf-mirror.com'; $env:NO_PROXY = '*'`。
 
 ---
 
@@ -94,12 +106,12 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 | `detections.json` | 每个原始检测框一条记录（含 `kept` 是否通过过滤） |
 | `tracks.json` | 每条人脸轨迹一条记录（含 `character_id`） |
 | `windows.json` | 总摘要 + 选中片段 + 本次所用的全部参数 |
-| `crops/track_<id>.jpg` | 每条轨迹一张代表裁剪图 |
+| `crops/track_<id>_<rank>.jpg` | 每条轨迹的代表裁剪图（`rank` 从 0 起，按清晰度降序，共 `crops_per_track` 张；默认 1 张） |
 | `clips/clip_<NNN>.mp4` | 切出的片段视频 |
 | `viz/sample_<NNN>.jpg` | 标注样本帧（全片蓄水池采样），仅 `--viz N` 时生成 |
 | `sweep.csv` | 阈值敏感性扫描结果，仅 `sweep.py` 生成（落在 `output/` 根下） |
 
-例（`魔女之旅_760s`，默认参数 + `--min-events 5`）：5 个切镜、100 个采样帧、35 条轨迹、`ccip_threshold=0.05` 下 20 个角色、2 个片段。
+例（`魔女之旅_760s`，出厂参数）：路由判 2d、5 个切镜、100 个采样帧、35 条轨迹、9 个角色（真值 9）、1 个片段。
 
 ---
 
@@ -107,19 +119,20 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 
 ```
 <video>.mp4
+  │ ⓪′ 抽 8 帧判画风 → 2d / 3d / real → 换上整套 detector+embedder+阈值+门槛
   │ ⓪ ffmpeg scdet 全帧率扫一趟 ← 独立的一趟解码，不抽帧，只出时刻表
   ▼ cuts = [t1, t2, ...]  (切镜时刻，秒)
   │
   │ ① cv2.VideoCapture 顺序解码，每 0.3s 取一帧
   ▼ (idx, time, frame_bgr)                   ← 生成器，一次只有一帧在内存
   │ ┌──────────── 同一趟循环内完成 ②③④ ────────────┐
-  │ ② 查 cuts 表(上一采样帧~本帧之间有切镜?)→cut ; YOLOv8检测→Detection[]
-  │ ③ 三道质量门槛 (置信度 / 人脸大小 / 清晰度) + 当帧就地裁脸
+  │ ② 查 cuts 表(上一采样帧~本帧之间有切镜?)→cut ; 检测→Detection[]
+  │ ③ 三道质量门槛 (置信度 / 人脸大小 / 清晰度) + 当帧就地裁脸(外扩或对齐)
   │    detection_records ──────────────────────────► detections.json
   │ ④ FaceTracker.update(): IoU 匹配 + 镜头切换断轨 + 代表裁剪图擂台
   │ └──────── 帧在此失去引用，内存立即回收 ────────┘
   ▼ tracks + crops/*.jpg
-  │ ⑤ CCIP 分批提取代表裁剪图特征 → complete-linkage 层次聚类 → 每条轨迹得 character_id
+  │ ⑤ 身份特征分批提取(CCIP 或 ArcFace) → complete-linkage 层次聚类 → 每条轨迹得 character_id
   ▼ tracks (带 character_id) ──► tracks.json
   │ ⑥ 滑窗统计"出现过"(区间相交)的不同角色数 ≥ min_events_per_window
   │    合格窗口的起点吸附到 cuts 里最近的切镜点(≤2s)，并在新位置复核角色数
@@ -136,7 +149,21 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 
 > 本节的绝对数量（2925 条检测、289 条轨迹、198 个角色……）来自已移除的 `data/1.mp4`（23 分钟整集），仅用于说明数据形态。
 
-### 阶段 1：流式解码 — `iter_frames`（[main.py:93](./src/main.py#L93)）
+### 阶段 0：画风路由 — `classify_style` / `apply_style`（[style.py](./src/style.py)）
+
+在任何解码之前先判画风，因为它决定后面用哪个检测器、怎么裁脸、拿什么特征聚类。均匀 seek 抽 `style_probe_frames=8` 帧，分两步判：
+
+1. **2D vs 非 2D**：`imgutils.validate.anime_classify` 多数投票（`bangumi` / `illustration` / `comic` 当 2D，`3d` 当非 2D）。9 段素材 9/9 正确。
+2. **3D CG vs 真人**：比两个人脸检测器在同一批帧上的**置信度之和之比** `anime / scrfd`，低于 `style_real_evidence_ratio=0.5` 判真人。实测 2D ≥1.15、3D CG 0.59~0.64、真人 0.29~0.30，三段之间有明显间隔。
+   - 动机：这个比值直接量的就是"这些脸有多像动漫脸"，而这正是选检测器要回答的问题。3D CG 动画的脸在这个尺度上恰好落在手绘与真人之间。
+   - **为什么不用 `imgutils.validate.anime_real`**：它把 `凡人修仙传_1040s`（3D CG）判成 real（6:2 票），3D CG 与真人分不开。
+   - **这条规则只有 4 个非 2D 样本，是拟合出来的**，换素材必须重验。
+
+`apply_style` 把整条 `StyleProfile` 一次性写进 Config 的副本（不改原对象）。`--no-style-routing` 关掉路由，全部素材共用 `config` 里的那一套——这也是做对照实验的入口（配合 `evaluate.py` 的 `--detector` / `--embedder` / `--crop-margin` / `--min-face-height`）。
+
+代价：一次性小开销，实测 <1s/段（比主循环里跑 100 帧检测便宜一个量级）。seek 被吸附到关键帧对画风判断没有影响。
+
+### 阶段 1：流式解码 — `iter_frames`（[main.py](./src/main.py)）
 
 - 用 `cv2.VideoCapture` 顺序解码，按 `frame_interval=0.3` 采样，**产出内存中的 BGR 数组**，不写任何中间文件。
 - 用 `grab()`/`retrieve()` 而非 seek：长 GOP 的 H.264 上 seek 会被吸附到关键帧，既不准也不快。`grab()` 跳过不需要的帧的色彩转换与内存拷贝，`retrieve()` 只在命中采样点时才真正取出图像。
@@ -144,9 +171,9 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 - `--limit-seconds N` 在此处**停止解码**（而非解码完再过滤），调参时省下的是真实时间。
 - 打不开视频或拿不到有效 fps 时直接抛 `RuntimeError`，不静默产出空序列。
 
-### 阶段 2：检测 + 镜头切换标记 — `scan_video` 主循环（[main.py:781](./src/main.py#L781)）
+### 阶段 2：检测 + 镜头切换标记 — `scan_video` 主循环（[main.py](./src/main.py)）
 
-**(a) 镜头切换检测** — `detect_cuts`（[main.py:644](./src/main.py#L644)）+ `_cut_between`（[main.py:688](./src/main.py#L688)）
+**(a) 镜头切换检测** — `detect_cuts`（[main.py](./src/main.py)）+ `_cut_between`（[main.py](./src/main.py)）
 
 主循环开始之前，先用 ffmpeg 的 **`scdet` 滤镜**全帧率扫一趟，拿到一张切镜时刻表：
 
@@ -161,18 +188,47 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 - **阈值默认 10**：手绘作画素材上逐帧人工验证过（魔女之旅 9/9、EVA_1730 11/11 全真）。CG 动作素材（如凡人修仙传）在 10 上偏保守，用 `--scdet-threshold 5`。
 - 这一节替换掉了旧的 HSV 直方图方案，原因与实测数字见"七、值得注意的细节"第 8 条。
 
-**(b) 人脸检测** — `detector.detect`（[detectors.py:123](./src/detectors.py#L123)）
-调用 `imgutils.detect.detect_faces`（YOLOv8 动漫脸模型，`level='s'`、`version='v1.4'`、`conf_threshold=0.5`）。每个框包装为 `Detection` 对象（frame_index、time、bbox、confidence、label="anime_face"）。
-- 检测器**吃的是 `PIL.Image.Image`，不是路径**——流式下帧不落盘，只能传内存对象。`to_pil`（[main.py:145](./src/main.py#L145)）负责 BGR→RGB 转换；`PIL.Image.Image` 是 imgutils `ImageTyping` 的成员，NumPy 数组不是。
-- 这个模型是**动漫脸**模型，`爱情神话` 那两段真人素材目前也在用它——分风格路由（第九节）要解决的正是这件事。
+**(b) 人脸检测** — `detector.detect`（[detectors.py](./src/detectors.py)）
 
-### 阶段 3：过滤 — 三道质量门槛 `passes_quality`（[main.py:195](./src/main.py#L195)）
+用哪个检测器由画风路由决定，两个实现都注册在 [`detectors.py`](./src/detectors.py) 的名字表里：
 
-对每个原始检测，先用 `crop_bbox`（[main.py:168](./src/main.py#L168)）**当帧就地裁出脸**，再补 `blur_var = laplacian_variance(crop)`，然后过三关：
+| 名称 | 模型 | 用于 | 关键点 |
+|---|---|---|---|
+| `anime_face_imgutils` | `imgutils.detect.detect_faces`（YOLOv8，`level='s'`、`version='v1.4'`） | 2D | 无 |
+| `real_face_scrfd` | InsightFace buffalo_l 的 SCRFD-10G onnx（`public-data/insightface`） | 3D CG、真人 | 5 点（双眼、鼻尖、双嘴角） |
+
+每个框包装为 `Detection`（frame_index、time、bbox、confidence、label、landmarks）。
+
+- 检测器**吃的是 `PIL.Image.Image`，不是路径**——流式下帧不落盘，只能传内存对象。`to_pil` 负责 BGR→RGB 转换；`PIL.Image.Image` 是 imgutils `ImageTyping` 的成员，NumPy 数组不是。
+- SCRFD 的后处理（三层 FPN 的距离编码解码 + NMS）自己写在 `RealFaceScrfd.detect` 里，没有引入 `insightface` 包——它会拖进一整条 albumentations/scikit-image 依赖链，而这里只用到其中约 40 行。
+- **两个检测器在对方的画风上都明显更弱**，这是路由存在的直接证据。8 帧抽样上的置信度之和：
+
+  | 素材 | 动漫脸 YOLO | SCRFD | 比值 |
+  |---|---:|---:|---:|
+  | 魔女之旅_760s（2D） | 18.10 | 8.41 | 2.15 |
+  | JOJO_635s（2D） | 19.07 | 16.56 | 1.15 |
+  | 凡人修仙传_1040s（3D） | 14.02 | 22.03 | 0.64 |
+  | 爱情神话_925s（真人） | 8.90 | 30.77 | 0.29 |
+
+  这个比值同时也是路由里"3D CG vs 真人"的判据，见第五节末。
+
+### 阶段 3：过滤 — 三道质量门槛 `passes_quality`（[main.py](./src/main.py)）
+
+对每个原始检测，先用 `crop_bbox`（[detectors.py](./src/detectors.py)）**当帧就地裁出脸**，再补 `blur_var = laplacian_variance(crop)`，然后过三关：
 
 1. `confidence ≥ 0.5`（`conf_threshold`）
-2. 人脸框高度 `≥ 0.045 × 帧高`（`min_face_height_ratio`，丢弃太小/太远的脸）
+2. 人脸框高度 `≥ min_face_height_ratio × 帧高`（丢弃太小/太远的脸；**按画风取值**：2D 0.03、3D CG 0.045、真人 0.09）
 3. `blur_var ≥ 50.0`（`blur_var_threshold`，丢弃模糊/运动拖影）
+
+**第 2 关为什么要按画风分**，两个方向的实测：
+
+- **2D 素材要放宽**。`新世纪福音战士_1270s` 多远景静止画，0.045 下全片只剩 12 条轨迹、7 个真值角色只检出 5 个（召回 0.71，长期是这批素材唯一的明显漏检）；降到 0.03 后 7/7 全中。
+- **真人素材要收紧**。SCRFD 的框只覆盖眉毛到下巴，同一张脸比动漫框矮一大截，同一个比例放进来的脸多得多；而真人实拍的街景里全是远景路人，人工标注只数出镜主体。`爱情神话_925s` 在 0.045 下有 128 条轨迹（真值 11 个角色），抬到 0.09 后降到 59 条，F1 从 0.88 升到 0.94。
+
+**通过质量门槛之后**才生成送去做身份识别的代表裁剪图（`Detector.make_crop`），口径同样跟着检测器走：
+
+- 2D：人脸框**外扩 `crop_margin=0.6` 倍**。CCIP 是按"角色图"训练的，而检测框紧贴五官——发型和发色（动漫角色身份最强的线索）恰好被裁在框外。实测把 2D 的 F1 从 0.91 抬到 0.95（同时把最优阈值从 0.178 推到 0.20）。
+- 3D CG / 真人：按 5 点关键点做**最小二乘相似变换**（Umeyama 闭式解）对齐到 ArcFace 的标准 112×112 姿态。不对齐直接喂裁剪图，人脸识别特征会明显退化。用闭式解而不是 `cv2.estimateAffinePartial2D`，是因为后者是 RANSAC/LMEDS 鲁棒估计，5 个点上不稳定也不可复现。
 
 这三关就是当前"谁算主体"的全部依据——**用画面显著程度替代剧情重要程度**，够清晰、够大的算主体，其余当路人。人工标注的口径（正脸、出镜 >1 秒、框宽占比达标）比它严，差距要靠第九节的正脸过滤和出镜时长统计补上。
 
@@ -182,46 +238,56 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 - **每个原始检测**（无论是否通过）都写入 `detection_records`，带 `kept: true/false` → 即 `detections.json`。
 - `--viz N` 用**蓄水池采样**从全片均匀抽 N 张标注帧；流式下不知道总帧数，且样本当场压成 JPEG 字节（≈200KB/张）才进池子，不留整帧（1080p ≈ 6MB/张）。
 
-### 阶段 4：跟踪 — `FaceTracker`（[main.py:225](./src/main.py#L225)）+ `save_representatives`（[main.py:366](./src/main.py#L366)）
+### 阶段 4：跟踪 — `FaceTracker`（[main.py](./src/main.py)）+ `save_representatives`（[main.py](./src/main.py)）
 
 把逐帧人脸框沿时间串成**轨迹（Track）**。一条轨迹 = 同一张脸的一次连续出现。
 
-跟踪器是**在线**的（`update()` 每帧调用一次），这是流式化的关键：代表裁剪图要挑"该轨迹内 `blur_var × confidence` 最大"的那张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那一帧，流式下帧已经丢了。于是改为**边跟踪边擂台**——每条活跃轨迹只留当前最优的一张裁剪图（`_offer`，[main.py:260](./src/main.py#L260)），来了更好的就换掉，落选的立刻解引用。内存占用因此只与**同时活跃的轨迹数**成正比，与视频长度无关。
+跟踪器是**在线**的（`update()` 每帧调用一次），这是流式化的关键：代表裁剪图要挑"该轨迹内 `blur_var × confidence` 最大"的那张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那一帧，流式下帧已经丢了。于是改为**边跟踪边擂台**——每条活跃轨迹只留当前最好的 `crops_per_track`（默认 1）张裁剪图（`_offer`，[main.py](./src/main.py)），来了更好的就挤掉最差的，落选的立刻解引用。内存占用因此只与**同时活跃的轨迹数**成正比，与视频长度无关。
 
 逐帧推进，核心逻辑：
 
-- **断轨**（[main.py:286](./src/main.py#L286)）：某活跃轨迹丢帧超过 `track_gap_tolerance`（1 帧），**或**它最后一帧到当前帧之间发生了镜头切换，即封存（finalize）。切换标记用一个 `blocked` 标志在线传播，等价于批处理版回看 `is_cut[]` 区间。
+- **断轨**（[main.py](./src/main.py)）：某活跃轨迹丢帧超过 `track_gap_tolerance`（1 帧），**或**它最后一帧到当前帧之间发生了镜头切换，即封存（finalize）。切换标记用一个 `blocked` 标志在线传播，等价于批处理版回看 `is_cut[]` 区间。
   → 这就是"镜头切换强制断轨"的来源：同一角色每次重新出场都是一条新轨迹（角色去重由阶段 5 负责）。
-- **贪心 IoU 匹配**（[main.py:309](./src/main.py#L309)）：当前帧的框与活跃轨迹最后一个框算 IoU，`≥0.3`（`iou_threshold`）且 label 相同才能接上；按 IoU 从高到低贪心配对，每条轨迹/每个框只用一次，避免"一个框被两条轨迹抢"或"一条轨迹接两个框"。
-- **新轨迹**（[main.py:244](./src/main.py#L244)）：未匹配任何轨迹的框，说明是一张新出现的脸，开一条新轨迹。
+- **贪心 IoU 匹配**（[main.py](./src/main.py)）：当前帧的框与活跃轨迹最后一个框算 IoU，`≥0.3`（`iou_threshold`）且 label 相同才能接上；按 IoU 从高到低贪心配对，每条轨迹/每个框只用一次，避免"一个框被两条轨迹抢"或"一条轨迹接两个框"。
+- **新轨迹**（[main.py](./src/main.py)）：未匹配任何轨迹的框，说明是一张新出现的脸，开一条新轨迹。
 
 封存的 Track 记录起止时间与所有成员检测，最后按 `start_time` 排序。
 
-`track_faces`（[main.py:345](./src/main.py#L345)）是喂满整个列表的批处理入口，只给单测用；主流程直接逐帧调 `update()`。
+`track_faces`（[main.py](./src/main.py)）是喂满整个列表的批处理入口，只给单测用；主流程直接逐帧调 `update()`。
 
-`save_representatives`：把跟踪时已选定的裁剪图写成 `crops/track_<id>.jpg`，然后释放数组引用。写入前先清空目录，保证重跑幂等（换参数往往产生更少轨迹，留着上一轮的 `track_N.jpg` 会与 `tracks.json` 对不上）。
+`save_representatives`：把跟踪时已选定的裁剪图写成 `crops/track_<id>_<rank>.jpg`，然后释放数组引用。写入前先清空目录，保证重跑幂等（换参数往往产生更少轨迹，留着上一轮的 `track_N.jpg` 会与 `tracks.json` 对不上）。
 
-- **中文路径**：落盘走 `imwrite_unicode`（[main.py:150](./src/main.py#L150)）而非 `cv2.imwrite`。后者在 Windows 上按 ANSI 代码页处理路径，遇到中文目录名**静默返回 `False`**——中文片名的视频会导致所有裁剪图丢失、所有 `character_id` 变成 `None`、最终一个片段都选不出来。绕开方式是 `cv2.imencode` + `numpy.tofile`。**当前素材文件名全是中文，这条随时会踩。**
+- **中文路径**：落盘走 `imwrite_unicode`（[main.py](./src/main.py)）而非 `cv2.imwrite`。后者在 Windows 上按 ANSI 代码页处理路径，遇到中文目录名**静默返回 `False`**——中文片名的视频会导致所有裁剪图丢失、所有 `character_id` 变成 `None`、最终一个片段都选不出来。绕开方式是 `cv2.imencode` + `numpy.tofile`。**当前素材文件名全是中文，这条随时会踩。**
 
-### 阶段 5：角色识别 — `assign_characters`（[main.py:477](./src/main.py#L477)）+ `_cluster_by_difference`（[main.py:390](./src/main.py#L390)）
+### 阶段 5：角色识别 — `assign_characters`（[main.py](./src/main.py)）+ `_cluster_by_difference`（[main.py](./src/main.py)）
 
 给每条轨迹一个**角色身份**（`character_id`），让后续选段能按"不同角色"去重计数。**这是全流水线最大的难点，也是当前误差的主要来源**（见第六节的实测对照）：
 
-- 对每条有代表裁剪图的轨迹，用 `imgutils.metrics` 的 **CCIP**（动漫角色相似度模型）提取 `crops/track_<id>.jpg` 的特征，再算两两差异矩阵（`compute_ccip_differences`，[main.py:429](./src/main.py#L429)）。特征**分批提取**（每批 32 张），避免一次性送入几百张图导致 ONNX 推理内存分配失败。
-- 特征提取与合并阈值无关，因此单独拆成一个函数——阈值扫描（见 `sweep.py`）可以只算一次、复用到所有阈值上。
-- 对差异矩阵做 **complete-linkage（全连接）层次聚类**（scipy `linkage` + `fcluster`）：簇内**任意两张**裁剪图差异都 `< ccip_threshold`（0.05）才允许同簇，同一簇 = 同一角色，簇编号即 `character_id`。**不做传递合并**——a~b 且 b~c 但 a、c 差异超阈值时，a、c 不会同簇（旧实现用并查集传递合并，差异链会把全片轨迹塌缩进一个簇，已弃用）。
-- 没有代表裁剪图（或文件缺失）的轨迹保持 `character_id=None`，**不参与角色计数**（无法确认身份就不算一个角色）。
-- CCIP 是按"角色图"训练的，这里喂的是纯脸部裁剪；侧脸、背身、遮挡的裁剪图特征最不可靠——这正是第九节"正脸过滤"的动机。
+身份特征也是可插拔的（[`embedders.py`](./src/embedders.py) 的名字表），由画风路由挑：
 
-### 阶段 6：选段 — `select_segments`（[main.py:528](./src/main.py#L528)）
+| 名称 | 模型 | 差异定义 | 同人阈值量级 |
+|---|---|---|---|
+| `ccip` | `imgutils.metrics` 的 CCIP | 模型自带 | ≈0.1~0.2 |
+| `arcface` | InsightFace `w600k_r50` | `1 − 余弦相似度` | ≈0.6~1.0 |
+
+两者都只暴露一个 `differences(crop_paths) -> N×N 矩阵`，聚类阶段不关心是谁算的。**注意两套阈值不在同一尺度上**，`evaluate.py --threshold` 扫网格时只有分风格那几列有意义。
+
+- 特征**分批提取**（每批 32 张），避免一次性送入几百张图导致 ONNX 推理内存分配失败。
+- 特征提取与合并阈值无关，因此单独拆成一个函数（`compute_differences`）——阈值扫描（见 `sweep.py`）可以只算一次、复用到所有阈值上。
+- 对差异矩阵做 **complete-linkage（全连接）层次聚类**（scipy `linkage` + `fcluster`）：簇内**任意两张**裁剪图差异都 `< identity_threshold` 才允许同簇，同一簇 = 同一角色，簇编号即 `character_id`。**不做传递合并**——a~b 且 b~c 但 a、c 差异超阈值时，a、c 不会同簇（旧实现用并查集传递合并，差异链会把全片轨迹塌缩进一个簇，已弃用）。
+- 没有代表裁剪图（或文件缺失）的轨迹保持 `character_id=None`，**不参与角色计数**（无法确认身份就不算一个角色）。
+- `crops_per_track > 1` 时一条轨迹有多张代表图，轨迹间的差异取 K×K 子块的**中位数**（不是最小值——最小值只要有一张脸偶然像另一个角色就会把两条轨迹粘起来，而 complete-linkage 的簇内约束会让这个错误继续扩散）。**默认 1**，多图版实测没有收益，见第六之三节。
+- 读中文路径的裁剪图必须走 `imread_unicode`（`cv2.imdecode` + `numpy.fromfile`）——`cv2.imread` 在 Windows 上遇中文目录名**静默返回 None**，和 `cv2.imwrite` 是同一个坑。
+
+### 阶段 6：选段 — `select_segments`（[main.py](./src/main.py)）
 
 统计窗口内**出现过的不同角色数**（"出现过" = 轨迹时间区间与窗口相交，包括窗口开始前就在画面中的角色）。
 
 - 轨迹按 `start_time` 排序，候选窗口起点 `t = k × 0.3（抽帧间隔）` 步进。
-- 对窗口 `[t, t+window)`，用 `bisect` 取所有 `start_time < t+window` 的前缀，再过滤 `end_time ≥ t`，得到与窗口相交的轨迹（`_characters_in_window`，[main.py:498](./src/main.py#L498)）。
-- 相交轨迹中不同 `character_id` 的数量（`None` 不计）`≥ min_events_per_window` → 窗口合格，输出片段，记录 `character_count`、`character_ids` 与 `track_ids`；随后**跳到 ≥ 片段终点**保证片段不重叠（[main.py:585](./src/main.py#L585)）；否则 `k += 1` 继续滑动。
+- 对窗口 `[t, t+window)`，用 `bisect` 取所有 `start_time < t+window` 的前缀，再过滤 `end_time ≥ t`，得到与窗口相交的轨迹（`_characters_in_window`，[main.py](./src/main.py)）。
+- 相交轨迹中不同 `character_id` 的数量（`None` 不计）`≥ min_events_per_window` → 窗口合格，输出片段，记录 `character_count`、`character_ids` 与 `track_ids`；随后**跳到 ≥ 片段终点**保证片段不重叠（[main.py](./src/main.py)）；否则 `k += 1` 继续滑动。
 
-**边界吸附**（`_nearest_cut`，[main.py:518](./src/main.py#L518)）：候选起点只是任意的 `k × 0.3s`，大概率切在镜头中间。合格窗口拿到后，起点会吸附到 `clip_snap_max_shift`（2.0s）以内最近的切镜点——实测平均镜头长 2.8~3.7s，默认值意味着绝大多数片段都会被吸附。
+**边界吸附**（`_nearest_cut`，[main.py](./src/main.py)）：候选起点只是任意的 `k × 0.3s`，大概率切在镜头中间。合格窗口拿到后，起点会吸附到 `clip_snap_max_shift`（2.0s）以内最近的切镜点——实测平均镜头长 2.8~3.7s，默认值意味着绝大多数片段都会被吸附。
 
 - 吸附后**必须在新位置重新统计角色数**（复用同一个 `_characters_in_window`），仍达标才采用，否则保持原起点。这不是可选的：`windows.json` 会记录每个片段的 `character_count` 和 `character_ids`，不重算就会写出与实际片段不符的数字。
 - 吸附点会让窗口越过视频末尾时同样放弃。
@@ -230,30 +296,30 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 
 产出 `segments` 列表 + `num_qualified` 计数 → 写入 `windows.json`。
 
-**注意**：在 30 秒素材上，`window_seconds=15` 意味着一段素材最多切出 2 个片段，而 `min_events_per_window=13` 远高于素材真值（4~11），默认参数下基本一个片段都选不出来。这两个默认值是为 23 分钟整集调的，改到 30/X 是第九节的第一项。
+**注意**：`window_seconds` 已固定为 30（需求口径就是 30 秒窗口，不再当可调参数），`min_events_per_window` 默认 4（9 段素材真值落在 4~11，取下界）。30 秒素材因此每段最多产出 1 个片段。
 
-### 阶段 7：截取 — `clip_segments`（[main.py:611](./src/main.py#L611)）
+### 阶段 7：截取 — `clip_segments`（[main.py](./src/main.py)）
 
 对每个片段用 ffmpeg 从**原视频**重新编码切 `window_seconds` 秒：
 
 - `-ss start -t window -c:v h264_nvenc -c:a aac`，帧精确。
 - `start` 已在阶段 6 吸附到镜头边界，所以切出来的片段以一个完整镜头开头，而不是从某个镜头的中间起。
-- 优先 GPU 编码器 `h264_nvenc`，失败自动回退 CPU `libx264`（[main.py:620](./src/main.py#L620)）。本机 `h264_nvenc` 实测可用。
+- 优先 GPU 编码器 `h264_nvenc`，失败自动回退 CPU `libx264`（[main.py](./src/main.py)）。本机 `h264_nvenc` 实测可用。
 
 ---
 
 ## 六、阈值敏感性扫描 — [`src/sweep.py`](./src/sweep.py)
 
-本流水线的两个关键参数会**互相补偿**：`ccip_threshold` 调严 → 同一角色被拆成多个身份 → 角色数虚高 → 更容易越过 `min_events_per_window` 门槛。两个参数一起动时，最终片段数可以在几倍范围内摆动，而这与"画面里到底有几个角色"没有必然关系。
+本流水线的两个关键参数会**互相补偿**：`identity_threshold` 调严 → 同一角色被拆成多个身份 → 角色数虚高 → 更容易越过 `min_events_per_window` 门槛。两个参数一起动时，最终片段数可以在几倍范围内摆动，而这与"画面里到底有几个角色"没有必然关系。
 
-`sweep.py` 在 `ccip_threshold × min_events_per_window` 的网格上重跑聚类与选段，把这个波动量化出来：
+`sweep.py` 在 `identity_threshold × min_events_per_window` 的网格上重跑聚类与选段，把这个波动量化出来：
 
 ```powershell
 & $py src/sweep.py data/*.mp4
-& $py src/sweep.py <video> --ccip 0.05,0.1,0.178 --min-events 3,5,8
+& $py src/sweep.py <video> --threshold 0.05,0.1,0.178 --min-events 3,5,8
 ```
 
-视频只解码一次、CCIP 特征只提取一次，网格上每个格子只是重跑一次层次聚类和滑窗计数，几乎免费——所以格子多不影响耗时。产出控制台表格 + `output/sweep.csv`。
+视频只解码一次、身份特征只提取一次，网格上每个格子只是重跑一次层次聚类和滑窗计数，几乎免费——所以格子多不影响耗时。产出控制台表格 + `output/sweep.csv`。`sweep.py` 同样走画风路由，所以不同画风的素材在同一张表里用的是各自的模型，**阈值那一列跨画风不可比**。
 
 **历史实测**（已移除的 `data/1.mp4`，1404 秒，289 条轨迹），格内为片段数：
 
@@ -266,7 +332,9 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 
 **只动这两个旋钮，角色数在 25~198 之间摆动（8 倍），片段数 1~33（33 倍）。** 而 289 条轨迹在 `ccip_threshold=0.05` 下被判成 198 个角色——几乎每条轨迹一个身份，等于角色去重基本没生效；把阈值放到模型自带的 0.178，同一批轨迹只剩 53 个角色。跨度越大，说明当前参数越是在**支配结论本身**，而不是在测量画面里的角色数。
 
-### 当前 9 段素材的基线（2026-08-17，`& $py src/sweep.py data/*.mp4`）
+### 9 段素材的旧基线（2026-08-17，路由与真人支路改造**之前**）
+
+> 下表是改造前的读数（全部素材共用动漫脸 YOLO + CCIP），保留是因为它是"没有通用阈值"这个结论的原始证据。当前的读数见第六之二节。
 
 每段 30 秒、100 个采样帧。"镜头数"列比较的是 scdet 刀数 +1 与文件名真值的段数；后四列是不同 `ccip_threshold` 下的角色数，最后一列是真值。**加粗**的是最接近真值的那一格。
 
@@ -298,11 +366,13 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 
 ```powershell
 & $py src/evaluate.py data/*.mp4                                    # 出厂配置（含画风路由）
-& $py src/evaluate.py data/*.mp4 --ccip 0.03,0.05,0.08,0.12,0.178,0.25   # 阈值网格
+& $py src/evaluate.py data/*.mp4 --threshold 0.12,0.178,0.2,0.85,0.95   # 阈值网格
 & $py src/evaluate.py data/*.mp4 --eyes 2                           # 打开正脸过滤做对照
+# 关掉路由做受控对照：把同一套模型/门槛压到全部素材上，再看分风格那几列
+& $py src/evaluate.py data/*.mp4 --no-style-routing --detector real_face_scrfd --embedder arcface --min-face-height 0.09
 ```
 
-产出控制台表格 + `<output-dir>/recall.csv`。与 `sweep.py` 一样，视频只解码一次、CCIP 特征只提一次，网格加格子几乎免费。
+产出控制台表格 + `<output-dir>/recall.csv`。与 `sweep.py` 一样，视频只解码一次、身份特征只提一次，网格加格子几乎免费。
 
 ### 召回率在这里的定义
 
@@ -316,41 +386,85 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 **选阈值看 `f1` 列**，不要看 `recall` 列：把一个角色拆成十个，召回是满分。数量精确率 `min(pred,gt)/pred` 惩罚这种拆分，与召回取调和平均后化简成 `f1 = 2·min(pred,gt)/(pred+gt)`。
 
+**阈值跨 embedder 不可比**：2D 走 CCIP（同人差异 ≈0.1~0.2），非 2D 走 ArcFace（≈0.6~1.0）。开着路由扫网格时，汇总表里的全局 macro 那几列没有意义，只有分风格那几列可读。
+
 ### 出厂配置下的逐视频召回（2026-08-18，`& $py src/evaluate.py data/*.mp4`）
 
-画风路由生效：2D 用 `ccip=0.178`，非 2D 用 `0.08`。
+| 素材 | 风格真值 | 路由判定 | 检测 + 特征 | 阈值 | 真值角色 | 检出角色 | 召回 | ratio | F1 |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| JOJO的奇妙冒险_635s | 2D | 2d ✅ | YOLO+CCIP | 0.20 | 9 | 7 | 0.78 | 0.78 | 0.88 |
+| 凡人修仙传_1040s | 3D | 3d ✅ | SCRFD+ArcFace | 0.85 | 6 | 6 | 1.00 | 1.00 | **1.00** |
+| 凡人修仙传_695s | 3D | 3d ✅ | SCRFD+ArcFace | 0.85 | 7 | 7 | 1.00 | 1.00 | **1.00** |
+| 擅长捉弄的高木同学_325s | 2D | 2d ✅ | YOLO+CCIP | 0.20 | 7 | 9 | 1.00 | 1.29 | 0.88 |
+| 新世纪福音战士_1050s | 2D | 2d ✅ | YOLO+CCIP | 0.20 | 6 | 6 | 1.00 | 1.00 | **1.00** |
+| 新世纪福音战士_1270s | 2D | 2d ✅ | YOLO+CCIP | 0.20 | 7 | 7 | 1.00 | 1.00 | **1.00** |
+| 爱情神话_1525s | 真人 | real ✅ | SCRFD+ArcFace | 0.85 | 4 | 4 | 1.00 | 1.00 | **1.00** |
+| 爱情神话_925s | 真人 | real ✅ | SCRFD+ArcFace | 0.85 | 11 | 14~15 | 1.00 | 1.27~1.36 | 0.85~0.88 |
+| 魔女之旅_760s | 2D | 2d ✅ | YOLO+CCIP | 0.20 | 9 | 9 | 1.00 | 1.00 | **1.00** |
+| **合计** | | **9/9** | | | 66 | | **macro 0.98 / micro 0.97** | | **0.96** |
 
-| 素材 | 风格真值 | 路由判定 | ccip | 真值角色 | 检出角色 | 召回 | ratio | F1 |
-|---|---|---|---:|---:|---:|---:|---:|---:|
-| JOJO的奇妙冒险_635s | 2D | 2d ✅ | 0.178 | 9 | 10 | 1.00 | 1.11 | 0.95 |
-| 凡人修仙传_1040s | 3D | non_2d ✅ | 0.080 | 6 | 6 | 1.00 | 1.00 | **1.00** |
-| 凡人修仙传_695s | 3D | non_2d ✅ | 0.080 | 7 | 6 | 0.86 | 0.86 | 0.92 |
-| 擅长捉弄的高木同学_325s | 2D | 2d ✅ | 0.178 | 7 | 8 | 1.00 | 1.14 | 0.93 |
-| 新世纪福音战士_1050s | 2D | 2d ✅ | 0.178 | 6 | 8 | 1.00 | 1.33 | 0.86 |
-| 新世纪福音战士_1270s | 2D | 2d ✅ | 0.178 | 7 | 5 | **0.71** | 0.71 | 0.83 |
-| 爱情神话_1525s | 真人 | non_2d ✅ | 0.080 | 4 | 6 | 1.00 | 1.50 | 0.80 |
-| 爱情神话_925s | 真人 | non_2d ✅ | 0.080 | 11 | 14 | 1.00 | 1.27 | 0.88 |
-| 魔女之旅_760s | 2D | 2d ✅ | 0.178 | 9 | 11 | 1.00 | 1.22 | 0.90 |
-| **合计** | | **9/9** | | 66 | | **macro 0.96 / micro 0.96** | | **0.90** |
+分风格：2D F1 0.95、3D CG **1.00**、真人 0.92。9 段里 **6 段角色数与真值完全一致**。
 
-读法：
+**逐次运行有 ±1 个角色的抖动**（`爱情神话_925s` 在 14 和 15 之间跳）。根因是 cuDNN 的卷积算法选择不是逐次确定的，特征上的微小差异会让恰好压在阈值边界上的一对轨迹翻面。量级在真值噪声之下，但引用小数点后两位时要知道这件事。
 
-- **9 段里 8 段召回 ≥ 0.86，唯一明显漏检的是 `新世纪福音战士_1270s`（0.71）**。它的失败发生在检测/过滤环，不是去重环：全片只有 12 条轨迹（素材中最少），该片多远景与静止画，脸在 `min_face_height_ratio` 这道门槛上就被刷掉了。任何 `ccip_threshold` 都救不了它。
-- **满分召回的 7 段里有 6 段 `ratio > 1`**，即普遍轻度过检（同一角色被拆成 1.1~1.5 个身份）。这是有意选的方向——门槛是"至少 X 人"，过检只会多选片段，漏检会静默丢掉合格片段。
-- **画风路由 9/9 判对**，且分风格最优阈值确实不同（2D 0.178 / 非 2D 0.08），这是路由存在的直接证据。关掉路由用单一阈值时，全局最优只到 macro F1 0.79（`ccip=0.12`）——**路由把 0.79 抬到 0.90**。
+### 这一轮优化前后（同一套素材、同一套评估脚本）
+
+| | 改造前（2026-08-18 上午） | 现在 |
+|---|---:|---:|
+| macro 召回 | 0.96 | **0.98** |
+| macro F1 | 0.90 | **0.96** |
+| 2D F1 | 0.89 | **0.95** |
+| 3D CG F1 | 0.96 | **1.00** |
+| 真人 F1 | 0.84 | **0.92** |
+| 画风路由 | 2 分类 9/9 | 3 分类 **9/9** |
+| 完全命中真值的素材数 | 1 / 9 | **6 / 9** |
+| 9 段总耗时 | 2m07s | 2m19s |
+
+四项改动各自的贡献（都在 9 段素材上按分风格最优 F1 量的）：
+
+| 改动 | 影响面 | F1 变化 |
+|---|---|---|
+| 真人/3D CG 换成 SCRFD + ArcFace | 3D CG、真人 | 3D 0.96→1.00，真人 0.84→0.92 |
+| 2D 代表裁剪图外扩 0.6 倍（带上发型） | 2D | 0.89→0.91 |
+| `min_face_height_ratio` 按画风分档（2D 0.03 / 3D 0.045 / 真人 0.09） | 全部 | 2D 0.91→0.95，真人 0.88→0.92 |
+| 画风路由从 2 分类扩到 3 分类 | 3D CG、真人 | 让上面两项能各自取到最优门槛 |
 
 ### 阈值网格（关掉路由，所有素材共用一个阈值）
 
-| ccip | macro 召回 | micro 召回 | 过检段数 | macro F1 | 2D (召回\|F1) | 3D | 真人 |
-|---:|---:|---:|---:|---:|---|---|---|
-| 0.030 | 0.98 | 0.98 | 8 | 0.52 | 0.97 \| 0.51 | 1.00 \| 0.56 | 1.00 \| 0.50 |
-| 0.050 | 0.98 | 0.98 | 8 | 0.60 | 0.97 \| 0.55 | 1.00 \| 0.74 | 1.00 \| 0.59 |
-| 0.080 | 0.97 | 0.97 | 6 | 0.76 | 0.97 \| 0.65 | 0.93 \| **0.96** | 1.00 \| 0.84 |
-| 0.120 | 0.86 | 0.85 | 4 | **0.79** | 0.97 \| 0.75 | 0.62 \| 0.76 | 0.82 \| **0.89** |
-| 0.178 | 0.72 | 0.73 | 4 | 0.77 | 0.94 \| **0.89** | 0.46 \| 0.63 | 0.43 \| 0.60 |
-| 0.250 | 0.52 | 0.52 | 0 | 0.66 | 0.68 \| 0.80 | 0.31 \| 0.47 | 0.34 \| 0.49 |
+原来的两分类路由（2D 用 CCIP 0.178、非 2D 用 CCIP 0.08）下的网格，保留作为对照——它说明"没有通用阈值"这件事：
 
-低阈值那几行是"召回 0.98 但 F1 只有 0.52"的典型陷阱：几乎每条轨迹一个身份，召回满分而完全没去重。**分风格最优点分别落在 2D 0.178、3D 0.08、真人 0.12**，三者互相冲突——这就是 `style_ccip_threshold` 这张表的由来（真人与 3D 合并成 non_2d 后取 0.08，两者共用一档的 F1 为 0.90，优于 0.12 的 0.83）。
+| ccip | macro 召回 | macro F1 | 2D (召回\|F1) | 3D | 真人 |
+|---:|---:|---:|---|---|---|
+| 0.030 | 0.98 | 0.52 | 0.97 \| 0.51 | 1.00 \| 0.56 | 1.00 \| 0.50 |
+| 0.080 | 0.97 | 0.76 | 0.97 \| 0.65 | 0.93 \| **0.96** | 1.00 \| 0.84 |
+| 0.120 | 0.86 | **0.79** | 0.97 \| 0.75 | 0.62 \| 0.76 | 0.82 \| **0.89** |
+| 0.178 | 0.72 | 0.77 | 0.94 \| **0.89** | 0.46 \| 0.63 | 0.43 \| 0.60 |
+| 0.250 | 0.52 | 0.66 | 0.68 \| 0.80 | 0.31 \| 0.47 | 0.34 \| 0.49 |
+
+低阈值那几行是"召回 0.98 但 F1 只有 0.52"的典型陷阱：几乎每条轨迹一个身份，召回满分而完全没去重。单一阈值的全局最优只到 0.79。
+
+### `min_face_height_ratio` 为什么必须按画风分档
+
+2D 支路（动漫脸 YOLO + CCIP，5 段 2D 素材，格内是分风格 macro F1）：
+
+| 外扩 \ 高度下限 | 0.03 | 0.045 |
+|---|---:|---:|
+| 0.0 | 0.91 | 0.89 |
+| 0.45 | **0.97** | 0.91 |
+| 0.6 | 0.96 | 0.93 |
+
+非 2D 支路（SCRFD + ArcFace，格内是该画风的最优 F1 及取到它的阈值）：
+
+| 高度下限 | 3D CG（2 段） | 真人（2 段） |
+|---|---|---|
+| 0.045 | **0.97** @0.85 | 0.88 @1.00 |
+| 0.06 | 1.00 @0.75（曲线陡，邻格掉到 0.82） | 0.92 @1.00 |
+| 0.09 | — | **0.92~0.93** @0.80~0.95（平台宽） |
+
+两张表一起读出两件事：
+
+1. **同一个 `identity_threshold`（0.85）在 3D CG 与真人上都是最优**——此前"非 2D 共用一个阈值只能到 F1 0.83"是**尺寸门槛**造成的假象，不是阈值本身的问题。
+2. 选参数要看**平台宽度**而不是单点峰值。真人在 0.09 上是 0.80~0.95 一整段都 ≈0.92，比 0.06 上那个只在 1.00 一个点成立的 0.92 稳得多；2D 同理选了外扩 0.6（0.178~0.21 都在 0.95 以上）而不是外扩 0.45 那个单点 0.97。
 
 ### 正脸过滤的 A/B：实测有害，因此默认关闭
 
@@ -366,7 +480,23 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 根因：`imgutils.detect.detect_eyes` 是**动漫眼**检测器，对真人和 3D CG 几乎不触发，开启后 `爱情神话_1525s` 的 23 条轨迹一条都没剩下，召回直接归零。而在它本该有效的 2D 素材上，把 CCIP 阈值重新调到各自最优后仍然更差（0.89 → 0.82）——筛掉的侧脸里有不少是某个角色**唯一**的出镜，丢掉它等于丢掉一个真值身份，这个损失盖过了特征变干净带来的收益。
 
-代码保留（`config.require_eyes` + `--eyes N`），因为它是这个对照实验唯一的复现手段。
+代码保留（`config.require_eyes` + `--eyes N`），因为它是这个对照实验唯一的复现手段。（注：这张表是在两分类路由 + 动漫脸检测器的旧配置上测的；真人支路换成 SCRFD 之后，"动漫眼检测器对真人不触发"这个根因只会更成立。）
+
+## 六之三、每轨迹多张代表图的 A/B：实测中性，因此默认 1 张
+
+`crops_per_track = 3` 的动机是降低方差：一条轨迹只靠一张代表图定身份，这张脸偶然拍糊/侧过头/被遮挡，整条轨迹的身份就错了。改成留 K 张、轨迹间差异取 K×K 子块的中位数，理论上更稳。
+
+实测（同样的阈值网格，取分风格最优 F1）：
+
+| | K=1（默认） | K=3 |
+|---|---:|---:|
+| 2D | **0.91** | 0.89 |
+| 3D CG | **1.00** | 0.97 |
+| 真人 | 0.87 | 0.87 |
+
+打平偏差。根因是**擂台榜按 `blur_var × confidence` 排序，前三名往往来自相邻几帧、内容高度冗余**——多出来的两张没带来新视角，而中位数比单张距离更高，反而把同一角色之间的距离抬上去了一点。要让它生效得改成"按时间均匀分布地取 K 张"，但轨迹本身常常只有几帧长，可挖的多样性有限。
+
+机制保留在 `config.crops_per_track`（这个 A/B 的复现手段），默认 1。K=1 时 `compute_differences` 直接短路，没有额外开销。
 
 ---
 
@@ -378,15 +508,15 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 2. **`detections.json` 可能不从 frame 0 开始**：片头/黑屏等区间检测器没有返回任何框（或返回的都低于 `conf_threshold` 被检测器内部丢弃），因此没有记录。这是正常现象。
 
-3. **`ccip_threshold` 与 `min_events_per_window` 是最关键的两个调参旋钮，且它们互相补偿**：CCIP 是按"角色图"训练的，这里输入的是纯脸部裁剪，模型自带阈值（≈0.178）偏松。聚类已改为 complete-linkage（簇内任意两两都要达标，不做传递合并），杜绝了差异链把全片轨迹塌缩成一个簇的问题。但在此基础上，`ccip_threshold` 单独一项就能让角色数摆动 8 倍，而 `min_events_per_window` 的门槛是拿角色数来比的——阈值调严会让角色数虚高，反过来更容易越过门槛。**两个参数中的任何一个都无法单独解释最终片段数**。换素材时先跑 `sweep.py` 看波动范围，再校准角色数，最后用 `--min-events` 控制出片多少。
+3. **`identity_threshold` 与 `min_events_per_window` 是最关键的两个调参旋钮，且它们互相补偿**：CCIP 是按"角色图"训练的，这里输入的是纯脸部裁剪，模型自带阈值（≈0.178）偏松。聚类已改为 complete-linkage（簇内任意两两都要达标，不做传递合并），杜绝了差异链把全片轨迹塌缩成一个簇的问题。但在此基础上，`identity_threshold` 单独一项就能让角色数摆动 8 倍，而 `min_events_per_window` 的门槛是拿角色数来比的——阈值调严会让角色数虚高，反过来更容易越过门槛。**两个参数中的任何一个都无法单独解释最终片段数**。换素材时先跑 `sweep.py` 看波动范围，再校准角色数，最后用 `--min-events` 控制出片多少。
 
 4. **在没有逐窗口人工真值的情况下，单次运行的数字不是测量**。现在 `data/` 下的 9 段素材带文件名真值，所以"角色数 vs 真值"这件事第一次变得可测——但真值本身也带标注噪声（模棱两可的脸很多）。**这套流水线适合用来找候选片段供人工筛选**，不适合用来断言"这段视频里有 N 个角色"或"本片不存在满足条件的片段"——后者尤其做不到：检测、身份去重、计数任一环节漏一次就会放过真实片段，系统只能给出"未发现"，无法证明"不存在"。
 
-5. **GPU 依赖**：检测走 ONNX（本机 onnxruntime 1.18.1 暴露 TensorRT / CUDA / CPU provider），编码默认 `h264_nvenc`。无 GPU 时编码自动回退 `libx264`，检测则取决于 onnxruntime 安装的 provider（`_report_providers` 会打印一次，见 [main.py:744](./src/main.py#L744)）。
+5. **GPU 依赖**：检测走 ONNX（本机 onnxruntime 1.18.1 暴露 TensorRT / CUDA / CPU provider），编码默认 `h264_nvenc`。无 GPU 时编码自动回退 `libx264`，检测则取决于 onnxruntime 安装的 provider（`_report_providers` 会打印一次，见 [main.py](./src/main.py)）。
 
-6. **Windows 中文路径**：`cv2.imwrite` 遇到中文目录名会静默失败（返回 `False`，不抛异常），写图一律走 `imwrite_unicode`。控制台输出走 `force_utf8_stdout`（[main.py:701](./src/main.py#L701)），否则中文片名在 UTF-8 终端下是乱码。`cv2.VideoCapture` 本身对中文路径正常。
+6. **Windows 中文路径**：`cv2.imwrite` 遇到中文目录名会静默失败（返回 `False`，不抛异常），写图一律走 `imwrite_unicode`。控制台输出走 `force_utf8_stdout`（[main.py](./src/main.py)），否则中文片名在 UTF-8 终端下是乱码。`cv2.VideoCapture` 本身对中文路径正常。
 
-7. **可扩展性**：检测器通过注册表（`@register`）插拔，下游跟踪/选段/截取只消费 `Detection` 对象，换成真人脸/3D 风格模型只需新增一个 `Detector` 子类（见 [detectors.py](./src/detectors.py) 模块说明）。新增检测器的 `detect()` 收到的是 `PIL.Image.Image`，不是路径。**分风格路由就落在这个插拔点上。**
+7. **可扩展性**：检测器和身份特征各有一张 `@register` 名字表（[detectors.py](./src/detectors.py) / [embedders.py](./src/embedders.py)），下游跟踪/选段/截取只消费 `Detection` 对象和一个 N×N 差异矩阵。**画风路由就落在这两个插拔点上**——`StyleProfile` 里存的就是这两张表的键。加一种画风 = 加一个 profile；加一种目标（动物、物体）= 加一个 `Detector` 子类。新增检测器的 `detect()` 收到的是 `PIL.Image.Image`（不是路径），要自定义裁剪口径就覆盖 `make_crop()`。检测器实例按名字在进程内缓存，同画风的多个视频不会重复加载模型。
 
 8. **切镜检测为什么不用直方图**：旧实现在 0.3s 抽帧上比较相邻两帧的 HSV（H、S）直方图相关性。在 `data/` 下 9 个片段上以 scdet 为参照实测（其中魔女之旅、EVA_1730、凡人修仙传_695s 三段已逐帧人工验证过对照图）：
 
@@ -406,7 +536,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 9. **依赖 ffmpeg 的非结构化日志**：`detect_cuts` 从 stderr 正则抓 `lavfi.scd.time`。这个 metadata key 自 scdet 滤镜引入以来稳定（当前环境 ffmpeg 8.1.1），但它终究是日志文本。returncode 非零即抛，不静默降级；**升级 ffmpeg 后若切镜数突然变 0，先查这条正则**。另：旧的 `--scene-cut` 参数已直接移除，旧命令行会报错退出而非静默忽略——这是刻意的。
 
-10. **误差不对称，所以切镜宁多勿少**：漏一刀会把两个角色粘成一条轨迹、**静默丢掉一个角色**；多切一刀只是把一条轨迹断成两段，阶段 5 的 CCIP 聚类会把它们还原成同一个 `character_id`。`cut_time_tolerance` 因此往灵敏侧放。
+10. **误差不对称，所以切镜宁多勿少**：漏一刀会把两个角色粘成一条轨迹、**静默丢掉一个角色**；多切一刀只是把一条轨迹断成两段，阶段 5 的身份聚类会把它们还原成同一个 `character_id`。`cut_time_tolerance` 因此往灵敏侧放。
 
 11. **"谁算主体"没有可计算依据**：`新世纪福音战士_1270s` 附近的绫波丽克隆体群像镜头，单帧检出 20+ 张脸，**全部是真检测**——但语义上它们是同一个角色。任何基于"画面里有几张脸"的口径都会在这类镜头上给出与人的直觉完全不同的数字。
 
@@ -420,33 +550,60 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 | `scdet_threshold` | 10.0 | ffmpeg scdet 阈值（0-100），调低检测到的切换更多；CG 动作素材建议 5 | `--scdet-threshold` |
 | `cut_time_tolerance` | 0.1 | 切镜时刻与采样区间匹配的容差（秒） | — |
 | `clip_snap_max_shift` | 2.0 | 片段起点吸附到切镜点的最大位移（秒），设 0 关闭 | — |
-| `detector` | anime_face_imgutils | 注册表里的检测器名称 | — |
-| `conf_threshold` | 0.5 | 检测置信度下限 | `--conf` |
-| `min_face_height_ratio` | 0.045 | 人脸最小高度占比 | — |
+| `style_routing` | True | 是否按画风换整套参数 | `--no-style-routing` |
+| `style_probe_frames` | 8 | 判画风时抽多少帧 | — |
+| `style_real_evidence_ratio` | 0.5 | 非 2D 素材里判"真人"的门槛（动漫检测器证据 / SCRFD 证据） | — |
+| `style_profiles` | 见下表 | 每种画风的整套参数 | — |
+| `conf_threshold` | 0.5 | 检测置信度下限（两个检测器共用） | `--conf` |
 | `blur_var_threshold` | 50.0 | 清晰度下限（拉普拉斯方差） | `--blur-var` |
+| `require_eyes` | 0（关） | 正脸门槛：脸上至少检出几只眼。**实测有害，见第六之二节** | `--eyes N`（evaluate.py） |
 | `iou_threshold` | 0.3 | 相邻帧连成同一轨迹的 IoU 下限 | — |
 | `track_gap_tolerance` | 1 | 轨迹关闭前允许连续丢帧数 | — |
-| `ccip_threshold` | 0.05 | 簇内任意两张裁剪图 CCIP 差异都低于此值才视为同一角色；设为 None 用模型自带阈值（≈0.178） | `--ccip-threshold` |
-| `window_seconds` | 15.0 | 片段长度（秒）**← 目标 30** | — |
-| `min_events_per_window` | 13 | 窗口合格所需的不同角色数 **← 目标 X（素材真值 4~11）** | `--min-events` |
+| `crops_per_track` | 1 | 每条轨迹留几张代表图参与聚类。**实测 >1 无收益，见第六之三节** | — |
+| `window_seconds` | 30.0 | 片段长度（秒），需求口径，不当可调参数 | — |
+| `min_events_per_window` | 4 | 窗口合格所需的不同角色数（素材真值 4~11，取下界） | `--min-events` |
 | `encoder` / `encoder_fallback` | h264_nvenc / libx264 | 视频编码器及回退 | `--encoder` |
 
+下面这四项由画风路由成套写入，**只有关掉路由（`--no-style-routing`）时 config 里的默认值才生效**：
+
+| 参数 | 2d | 3d | real | 关路由时的默认值 | CLI 覆盖 |
+|---|---|---|---|---|---|
+| `detector` | anime_face_imgutils | real_face_scrfd | real_face_scrfd | anime_face_imgutils | `--detector`（evaluate.py） |
+| `embedder` | ccip | arcface | arcface | ccip | `--embedder`（evaluate.py） |
+| `identity_threshold` | 0.20 | 0.85 | 0.85 | 0.178 | `--identity-threshold` |
+| `crop_margin` | 0.6 | 0.0 | 0.0 | 0.0 | `--crop-margin` |
+| `min_face_height_ratio` | 0.03 | 0.045 | 0.09 | 0.045 | `--min-face-height`（evaluate.py） |
+
 调试用参数：`--limit-seconds`（只处理前 N 秒，到点即停止解码）、`--viz N`（蓄水池采样导出 N 张标注帧）。
+
+### 模型与首次下载
+
+| 模型 | 仓库 | 用于 |
+|---|---|---|
+| `face_detect_v1.4_s` | `deepghs/anime_face_detection` | 2D 人脸检测 |
+| CCIP | `deepghs/ccip_onnx` | 2D 角色身份 |
+| `anime_classification` | `deepghs/anime_classification` | 画风判定第 1 步 |
+| SCRFD-10G | `public-data/insightface`（`models/buffalo_l/det_10g.onnx`） | 3D CG / 真人脸检测 |
+| ArcFace `w600k_r50` | `public-data/insightface`（`models/buffalo_l/w600k_r50.onnx`） | 3D CG / 真人身份 |
+
+全部走 HuggingFace 缓存（`~/.cache/huggingface/hub`）。**首次运行需要联网**下载后两个（约 17 MB + 166 MB）；下完之后加 `$env:HF_HUB_OFFLINE = '1'` 可完全离线跑。
 
 ---
 
 ## 九、已完成与仍未解决
 
-重启后的四项改造已全部落地（详见第六之二节）：窗口 30 秒 + 门槛 4；画风路由（[`style.py`](./src/style.py)，9/9 判对）；正脸过滤（已实现但实测有害，默认关）；召回评估（[`evaluate.py`](./src/evaluate.py)，macro 召回 0.96 / F1 0.90）。
+本轮优化后的状态（详见第六之二节）：画风三分类路由 9/9；2D 走动漫脸 YOLO + CCIP（裁剪外扩带上发型），3D CG 与真人走 SCRFD + ArcFace（关键点对齐）；`min_face_height_ratio` 按画风分档。**macro 召回 0.98 / macro F1 0.96**，9 段素材里 6 段角色数与真值完全一致。
 
 仍未解决的，按优先级：
 
-1. **`新世纪福音战士_1270s` 这类远景素材的漏检（召回 0.71）**：瓶颈在检测/过滤环，脸太小被 `min_face_height_ratio = 0.045` 刷掉。调低这道门槛会同时放进大量路人脸，需要先有"主体 vs 路人"的更好判据（见第 3 条），否则只是把漏检换成过检。
+1. **参数是在 9 个样本上拟合的**：三套 profile 里的每个数字（`identity_threshold`、`crop_margin`、`min_face_height_ratio`）都是对这 9 段素材的 macro F1 调出来的，其中非 2D 只有 2+2 段。**换素材必须重跑 `evaluate.py --threshold` 网格重新定值**，不要直接沿用。第六之二节末尾那两张表给出的是重新定值的方法（看平台宽度，不看单点峰值）。
 
-2. **`style_ccip_threshold` 只在这 9 段素材上调过**：两个值（2D 0.178 / 非 2D 0.08）是对 9 个样本的 macro F1 拟合出来的，样本量不足以说它能泛化。换素材必须重跑 `evaluate.py --ccip` 网格重新定值，不要直接沿用。
+2. **"3D CG vs 真人"的判据只有 4 个样本**：检测器证据比在这 4 段上间隔很宽（0.59~0.64 vs 0.29~0.30），但样本量不足以说它能泛化。判错的代价是尺寸门槛用错一档（0.045 vs 0.09），不是灾难性的，但会明显掉 F1。
 
-3. **主体判定仍是"画面显著程度"（清晰度 + 人脸框占比），不是"剧情重要程度"**。更好的代理量是出镜时长 + 出现频次，但它完全依赖跨镜头去重的准确率——现在的 F1 0.90 还不足以支撑按身份累计时长。
+3. **主体判定仍是"画面显著程度"（清晰度 + 人脸框占比），不是"剧情重要程度"**。更好的代理量是出镜时长 + 出现频次，跨镜头去重的 F1 到了 0.95 之后这条路开始可行，但还需要先有逐身份（而不是逐数量）的真值才能验证。
 
-4. **真人与 3D 共用一套参数**：`anime_classify` 的 `3d` 类同时收下真人和 3D CG，区分不了。目前两者在 CCIP 上误差方向一致（都低估），共用 0.08 可接受；素材扩展后若两者分化，需要另找分类器。
+4. **剩下三段没打满的素材是两个方向的误差**：`JOJO_635s` 检出 7 / 真值 9、`高木同学_325s` 检出 9 / 真值 7（同一个 2D 阈值 0.20 一边合并过头一边拆分过头），`爱情神话_925s` 检出 14~15 / 真值 11（街景里被判成主体的路人）。靠单一阈值调不动。
 
 5. **真值本身有噪声**：标注时存在大量模棱两可的脸，且"首尾不完整的镜头算不算"这类口径问题没有统一。上面所有小数点后两位的数字，都应按数量级读。
+
+6. **存在性判断只能给"未发现"**：检测、身份去重、计数任一环节漏一次就会放过真实片段，系统无法证明"不存在"。

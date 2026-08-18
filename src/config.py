@@ -9,6 +9,32 @@ from typing import Dict, Optional
 
 
 @dataclasses.dataclass
+class StyleProfile:
+    """一种画风对应的整套识别参数。
+
+    这四个参数是耦合的，必须成套换：真人素材要用真人脸检测器，而真人脸检测器
+    产出的是对齐好的 112×112 人脸，只有 ArcFace 认；ArcFace 的差异尺度又和
+    CCIP 完全不同，阈值不能共用。拆成四张独立的表就会拼出无意义的组合。
+
+    属性：
+        detector: detectors.py 里注册的检测器名。
+        embedder: embedders.py 里注册的身份特征名。
+        identity_threshold: 两条轨迹的代表图差异低于它就算同一个人。
+        crop_margin: 代表裁剪图相对人脸框的外扩比例（ArcFace 走对齐，不看它）。
+        min_face_height_ratio: 人脸框高度占画面高度的下限。这个也必须跟着
+            检测器走：动漫脸 YOLO 的框连着大半个头，SCRFD 的框只到眉毛~下巴，
+            同一张脸后者的框明显更矮，共用一个比例会让真人素材放进大量
+            远景路人（实测 爱情神话_925s 因此从 48 条轨迹涨到 128 条）。
+    """
+
+    detector: str
+    embedder: str
+    identity_threshold: float
+    crop_margin: float
+    min_face_height_ratio: float
+
+
+@dataclasses.dataclass
 class Config:
     """整个流程的可调参数。
 
@@ -44,6 +70,11 @@ class Config:
     # 人脸裁剪图的最小拉普拉斯方差（用于丢弃模糊或运动拖影的人脸）。
     # 经验值；先用偏保守的低值，检查输出后再提高。
     blur_var_threshold: float = 50.0
+    # 代表裁剪图在人脸框基础上向外扩多少（框宽/高的倍数）。0 = 用紧贴的人脸框。
+    # 动机：CCIP 按「角色图」训练，而检测器给的是紧贴五官的人脸框，发型/发色
+    # ——动漫角色身份最强的线索——恰好被裁在框外。外扩把它带回来。
+    # 只影响送进 CCIP 的裁剪图；质量过滤（大小、清晰度）仍按原始人脸框算。
+    crop_margin: float = 0.0
     # 正脸判定：人脸裁剪图上至少要检出这么多只眼睛才保留。0 = 关闭。
     # 动机本来是跨镜头身份去重——非正脸的 CCIP 特征最不可靠，宁可丢掉。
     #
@@ -61,25 +92,49 @@ class Config:
     iou_threshold: float = 0.3
     # 轨迹关闭前允许连续丢失的帧数。
     track_gap_tolerance: int = 1
+    # 每条轨迹留几张代表裁剪图参与身份聚类。1 = 只留最清晰的那张。
+    # >1 时轨迹间的差异取「两侧代表图两两差异的中位数」，单张脸偶然拍糊、
+    # 侧过头、被遮挡就不再能单独决定这条轨迹的身份。内存代价是每条**活跃**
+    # 轨迹多留 K-1 张小图，与视频长度无关。
+    #
+    # 实测结论是**默认 1**（见 README 第六之三节的 A/B）：K=3 在 9 段素材上
+    # 与 K=1 打平偏差（2d 0.89 vs 0.91、3d 0.97 vs 1.00、real 持平）。原因是
+    # 榜单按 blur_var×confidence 排序，前三名往往来自相邻几帧、内容高度冗余，
+    # 多出来的两张没带来新视角，中位数反而抬高了同一角色之间的距离。
+    # 要复现该对照把它改成 3。
+    crops_per_track: int = 1
 
     # === 画风路由 ===
-    # 关闭后所有素材共用下面的 ccip_threshold。
+    # 关闭后所有素材共用下面的 detector / embedder / identity_threshold。
     style_routing: bool = True
-    # 判画风时均匀抽多少帧投票（imgutils.validate.anime_classify）。
+    # 判画风时均匀抽多少帧投票。
     style_probe_frames: int = 8
-    # 每种风格用的 CCIP 阈值。CCIP 按动漫角色图训练，2D 与非 2D 的误差方向
-    # 相反（2D 高估角色数、真人/3D 低估），所以这是唯一必须按风格分岔的参数。
-    # 取值来自 evaluate.py 在 9 段素材上按 macro F1 挑出的分风格最优
-    # （2D 的最优阈值恰好落在 imgutils 自带的默认值 0.178 上，非 2D 明显更低）。
-    style_ccip_threshold: Dict[str, float] = dataclasses.field(
-        default_factory=lambda: {"2d": 0.178, "non_2d": 0.08}
+    # 非 2D 素材再分「真人 / 3D CG」的门槛：抽样帧上
+    # 动漫脸检测器证据 / 真人脸检测器证据 低于它就判真人。
+    # 9 段素材实测 3D CG 落在 0.64~0.69、真人落在 0.32~0.38，取中间值。
+    style_real_evidence_ratio: float = 0.5
+    # 每种画风的整套识别参数（见 StyleProfile）。取值来自 evaluate.py 在 9 段
+    # 素材上按 macro F1 挑出的分风格最优，换素材必须重新扫网格定值。
+    style_profiles: Dict[str, StyleProfile] = dataclasses.field(
+        default_factory=lambda: {
+            # 2D：动漫脸 YOLO + CCIP，裁剪外扩 0.6 倍把发型带进特征。
+            "2d": StyleProfile("anime_face_imgutils", "ccip", 0.20, 0.6, 0.03),
+            # 3D CG / 真人：SCRFD + ArcFace，按关键点对齐（不外扩）。
+            # 两者的最优 ArcFace 阈值相同（0.85），差别只在人脸尺寸门槛：
+            # 真人实拍的街景里全是远景路人，而人工标注只数出镜主体，
+            # 门槛不抬到 0.09 会把它们全放进来（爱情神话_925s 128 条轨迹 vs 真值 11 个角色）。
+            "3d": StyleProfile("real_face_scrfd", "arcface", 0.85, 0.0, 0.045),
+            "real": StyleProfile("real_face_scrfd", "arcface", 0.85, 0.0, 0.09),
+        }
     )
 
-    # === 角色识别（CCIP）===
-    # 两条轨迹代表裁剪图的 CCIP 差异低于该阈值时视为同一角色。
-    # None = 使用 imgutils 的 ccip_default_threshold()（约 0.178）。
+    # === 角色识别 ===
+    # 身份特征名（见 embedders.py）：ccip = 动漫角色，arcface = 真人脸。
+    embedder: str = "ccip"
+    # 两条轨迹代表裁剪图的差异低于该阈值时视为同一角色。
+    # None = 使用该 embedder 自带的默认阈值。
     # 调低更严格、更容易把同一角色拆成多个；调高更容易合并。
-    ccip_threshold: Optional[float] = 0.05
+    identity_threshold: Optional[float] = 0.178
 
     # === 选段（滑窗计数 + 贪心）===
     # 需求口径就是"时长 ≤30 秒、出镜主体达到 X 人的片段"，因此窗口固定 30 秒。
