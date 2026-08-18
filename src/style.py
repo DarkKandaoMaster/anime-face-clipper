@@ -133,4 +133,5 @@ def apply_style(config: Config, style: str) -> Config:
         identity_threshold=profile.identity_threshold,
         crop_margin=profile.crop_margin,
         min_face_height_ratio=profile.min_face_height_ratio,
+        frontal_weight=profile.frontal_weight,
     )

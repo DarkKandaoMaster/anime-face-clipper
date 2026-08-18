@@ -47,7 +47,7 @@ from PIL import Image
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from config import Config
+from config import Config, set_frontal_weight
 from detectors import (
     Detection,
     Detector,
@@ -63,7 +63,7 @@ from style import apply_style, classify_style
 # 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
 __all__ = [
     "Detection", "Track", "crop_bbox", "expand_bbox",
-    "process_video", "run_pipeline", "main",
+    "filter_short_tracks", "process_video", "run_pipeline", "main",
 ]
 
 
@@ -80,6 +80,7 @@ class Track:
         representative_frame: 最清晰检测结果所在的帧索引。
         representative_time: 该检测结果的时间戳。
         representative_bbox: 该检测结果的框（仅作溯源记录）。
+        representative_frontal: 该检测结果的正脸分（没算过则为 None）。
         representative_images: 跟踪时在线留存的 BGR 裁剪图，按清晰度降序，
             最多 config.crops_per_track 张；写盘后清空。
         representative_crops: 保存的裁剪图路径（相对于输出目录），与上面同序。
@@ -97,6 +98,7 @@ class Track:
     representative_frame: int = -1
     representative_time: float = 0.0
     representative_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    representative_frontal: Optional[float] = None
     representative_images: List[np.ndarray] = dataclasses.field(default_factory=list)
     representative_crops: List[str] = dataclasses.field(default_factory=list)
     representative_crop: str = ""
@@ -271,7 +273,7 @@ class FaceTracker:
             "last_index": index,
             "dets": [det],
             "blocked": False,
-            # 擂台榜：(score, crop) 按 score 降序，最多 crops_per_track 条。
+            # 擂台榜：(score, crop, frame_index) 按 score 降序，最多 crops_per_track 条。
             "best": [],
             # 榜首那张脸的位置信息。单独存是因为退化框（crop 为 None）也该留下
             # 溯源记录，而它进不了擂台榜。
@@ -283,18 +285,37 @@ class FaceTracker:
         self._offer(track, det)
 
     def _offer(self, track: Dict, det: Detection) -> None:
-        """让 det 参与该轨迹的代表擂台；无论胜负都释放 det 持有的裁剪图。"""
+        """让 det 参与该轨迹的代表擂台；无论胜负都释放 det 持有的裁剪图。
+
+        擂台分 = blur_var × confidence × (1 - w + w × frontal)。正脸权重 w 只改
+        「这条轨迹送哪一张脸去聚类」，不决定轨迹的存亡——非正脸的身份特征最不
+        可靠，但把它整条丢掉会连角色一起丢（README 第六之二节）。
+        """
         score = (det.blur_var or 0.0) * det.confidence
+        weight = self._config.frontal_weight
+        if weight > 0 and det.frontal is not None:
+            score *= 1.0 - weight + weight * det.frontal
         if score > track["best_score"]:
             track["best_score"] = score
             track["best_det"] = det
         board = track["best"]
-        if det.crop is not None and (
-            len(board) < self._config.crops_per_track or score > board[-1][0]
-        ):
-            board.append((score, det.crop))
-            board.sort(key=lambda item: item[0], reverse=True)
-            del board[self._config.crops_per_track:]  # 挤出榜的裁剪图在此失去引用
+        if det.crop is not None:
+            # 时间去冗余：擂台前 K 名默认会挤在相邻几帧（同一张脸算 K 遍）。要求
+            # 榜上各张至少隔开 crop_min_gap_frames 个采样帧，K>1 才真的是多视角。
+            gap = self._config.crop_min_gap_frames
+            near = next(
+                (i for i, item in enumerate(board)
+                 if abs(item[2] - det.frame_index) < gap), None
+            ) if gap > 0 else None
+            if near is not None:
+                # 撞上同一段时间：只保留这一段里更好的那张，不占额外名额。
+                if score > board[near][0]:
+                    board[near] = (score, det.crop, det.frame_index)
+                    board.sort(key=lambda item: item[0], reverse=True)
+            elif len(board) < self._config.crops_per_track or score > board[-1][0]:
+                board.append((score, det.crop, det.frame_index))
+                board.sort(key=lambda item: item[0], reverse=True)
+                del board[self._config.crops_per_track:]  # 挤出榜的裁剪图在此失去引用
         det.crop = None  # 落选的裁剪图到此为止，不随 dets 列表一路累积
 
     def _finalize(self, track: Dict) -> None:
@@ -310,7 +331,8 @@ class FaceTracker:
                 representative_frame=best.frame_index if best else -1,
                 representative_time=best.time if best else 0.0,
                 representative_bbox=best.bbox if best else (0, 0, 0, 0),
-                representative_images=[crop for _score, crop in track["best"]],
+                representative_frontal=best.frontal if best else None,
+                representative_images=[crop for _score, crop, _index in track["best"]],
             )
         )
 
@@ -392,6 +414,22 @@ def track_faces(
     for i, dets in enumerate(frame_detections):
         tracker.update(i, is_cut[i], dets)
     return tracker.finish()
+
+
+def filter_short_tracks(tracks: List[Track], min_seconds: float) -> List[Track]:
+    """丢掉出镜时长短于 min_seconds 的轨迹。
+
+    这条门槛直接对应**人工标注的口径**——只有"出镜 >1 秒"的脸才被数成一个主体，
+    而流水线此前完全没有实现它。代价是一闪而过的脸会各自聚成一个身份，直接抬高
+    窗内角色数：`魔女之旅` 整集 788 条轨迹里中位轨迹只有 1 个采样帧。
+
+    时长按 ``end_time - start_time`` 算，所以 n 个采样帧的轨迹时长是
+    ``(n - 1) × frame_interval``，单帧轨迹时长为 0。
+
+    调用点在跟踪之后、写代表图之前：时长只有轨迹封存后才知道，而注定被丢的轨迹
+    不值得再写一次盘。
+    """
+    return [t for t in tracks if t.end_time - t.start_time >= min_seconds]
 
 
 def save_representatives(tracks: List[Track], crops_dir: str) -> None:
@@ -765,6 +803,7 @@ def _detection_record(det: Detection, kept: bool) -> Dict:
         "label": det.label,
         "blur_var": round(det.blur_var, 2) if det.blur_var is not None else None,
         "num_eyes": det.num_eyes,
+        "frontal": round(det.frontal, 3) if det.frontal is not None else None,
         "kept": kept,
     }
 
@@ -779,6 +818,7 @@ def _track_record(track: Track) -> Dict:
         "representative_frame": track.representative_frame,
         "representative_time": round(track.representative_time, 3),
         "representative_bbox": list(track.representative_bbox),
+        "representative_frontal": track.representative_frontal,
         "representative_crops": track.representative_crops,
         "character_id": track.character_id,
     }
@@ -861,6 +901,9 @@ def scan_video(
 
     tracker = FaceTracker(config)
     detection_records: List[Dict] = []
+    # 正脸分要么进擂台加权、要么当硬门槛；两者都不用时连推理都不跑
+    # （2D 支路的动漫眼检测是每张脸一次 ONNX，不是免费的）。
+    need_frontal = config.frontal_weight > 0 or config.min_frontal_score > 0
     prev_time: Optional[float] = None
     num_frames = 0
     # 蓄水池采样：流式下不知道总帧数，靠它从整段视频均匀抽 viz_count 张样本帧。
@@ -887,6 +930,11 @@ def scan_video(
             # 先过三道便宜门槛，再对幸存者跑眼睛检测（正脸判定），避免给注定
             # 被刷掉的脸白跑一次推理。
             ok = passes_quality(det, frame_h, config)
+            if ok and need_frontal:
+                # 正脸分必须在**紧贴人脸框**的裁剪图上算：外扩后的图会把旁边
+                # 那张脸的眼睛也框进来。算完才换成检测器口径的代表裁剪图。
+                det.frontal = detector.frontal_score(det.crop, det)
+                ok = det.frontal >= config.min_frontal_score
             if ok:
                 # 幸存者才换成检测器指定口径的代表裁剪图（动漫脸外扩带上发型、
                 # 真人脸按关键点对齐）；注定被刷掉的脸不值得多跑一次。
@@ -912,6 +960,11 @@ def scan_video(
         # image 在此失去最后一个引用，整帧内存立即可回收。
 
     tracks = tracker.finish()
+    if config.min_track_seconds > 0:
+        kept_tracks = filter_short_tracks(tracks, config.min_track_seconds)
+        print(f"[{stem}] {len(tracks) - len(kept_tracks)} tracks shorter than "
+              f"{config.min_track_seconds}s dropped")
+        tracks = kept_tracks
     print(f"[{stem}] {num_frames} frames sampled, {len(tracks)} tracks")
 
     save_representatives(tracks, os.path.join(out_dir, "crops"))
@@ -934,6 +987,7 @@ def process_video(
     output_root: str,
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
+    clip: bool = True,
 ) -> Dict:
     """对单个视频运行完整流程。
 
@@ -943,6 +997,8 @@ def process_video(
         output_root: 基础输出目录；结果会写入 <root>/<stem>/。
         limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
         viz_count: 随机导出的标注示例帧数量。
+        clip: 是否真的把选中的片段编码出来。False 时只写 JSON——在长片上
+            做批量测量时，编码几十个 30 秒片段的耗时会盖过流水线本身。
 
     返回：
         摘要字典（也会持久化到 JSON 文件中）。
@@ -982,7 +1038,7 @@ def process_video(
 
     # 截取片段。
     clips_dir = os.path.join(out_dir, "clips")
-    clip_paths = clip_segments(config, video_path, segments, clips_dir)
+    clip_paths = clip_segments(config, video_path, segments, clips_dir) if clip else []
 
     # 持久化输出。
     _write_json(os.path.join(out_dir, "detections.json"), detection_records)
@@ -1051,11 +1107,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-margin", type=float, help="Override crop_margin.") # 代表裁剪图相对人脸框的外扩比例。CCIP 靠它把发型带进特征；ArcFace 走关键点对齐，不受影响。
     parser.add_argument("--frame-interval", type=float, help="Override frame_interval.") # 抽帧间隔秒数（默认 0.3）。调小则采样更密、更慢更准。
     parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).") # 视频编码器（默认 h264_nvenc）。失败会自动回退到 libx264；无 GPU 时显式传 libx264。
-    parser.add_argument("--eyes", type=int, metavar="N", help="Require N eyes per face (frontal filter). 0 = off (default).") # 正脸过滤：脸上至少检出 N 只眼才保留。默认 0（关）——实测有害，见 README 第六之二节；传 2 可复现那组对照。
+    parser.add_argument("--frontal-weight", type=float, metavar="W", help="Weight of the frontal score in representative-crop ranking (0 = off).") # 正脸分在代表图擂台里的权重。只换「这条轨迹送哪张脸去聚类」，不丢轨迹。
+    parser.add_argument("--min-frontal", type=float, metavar="S", help="Drop faces whose frontal score is below S (0 = off).") # 正脸硬门槛
+    parser.add_argument("--min-track-seconds", type=float, metavar="S", help="Drop tracks shorter than S seconds on screen (0 = off).") # 最短出镜时长，对应人工标注的"出镜 >1s"口径 # 正脸硬门槛：分数低于 S 的框直接丢。默认 0（关）——硬筛会连角色一起丢，见 README 第六之二节。
+    parser.add_argument("--eyes", type=int, metavar="N", help="Require N eyes per face (legacy frontal filter). 0 = off (default).") # 正脸过滤：脸上至少检出 N 只眼才保留。默认 0（关）——实测有害，见 README 第六之二节；传 2 可复现那组对照。
     parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one detector/embedder/threshold for all.") # 关掉画风路由，所有素材共用 config 里的 detector / embedder / identity_threshold。
     # 运行 / 调试参数。
     parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
-    parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.") # 导出 N 张带标注的样本帧（蓄水池采样，均匀分布于全片），用于肉眼检查检测/过滤效果（默认 0，不导出）。
+    parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.")
+    parser.add_argument("--no-clip", action="store_true", help="Analyse only; skip encoding the selected clips.") # 只跑分析、不编码片段。批量实测长片时用：JSON 照写，省掉几十个 30 秒片段的编码时间。 # 导出 N 张带标注的样本帧（蓄水池采样，均匀分布于全片），用于肉眼检查检测/过滤效果（默认 0，不导出）。
     return parser
 
 
@@ -1083,6 +1143,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.encoder = args.encoder
     if args.eyes is not None:
         config.require_eyes = args.eyes
+    if args.frontal_weight is not None:
+        set_frontal_weight(config, args.frontal_weight)
+    if args.min_frontal is not None:
+        config.min_frontal_score = args.min_frontal
+    if args.min_track_seconds is not None:
+        config.min_track_seconds = args.min_track_seconds
     if args.no_style_routing:
         config.style_routing = False
 
@@ -1092,6 +1158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.output_dir,
         limit_seconds=args.limit_seconds,
         viz_count=args.viz,
+        clip=not args.no_clip,
     )
     return 0
 

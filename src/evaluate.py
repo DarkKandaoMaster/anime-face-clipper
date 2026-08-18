@@ -39,7 +39,7 @@ import csv
 import os
 from typing import Dict, List, Optional
 
-from config import Config
+from config import Config, set_frontal_weight
 from groundtruth import GroundTruth, parse_ground_truth
 from main import (
     _cluster_by_difference,
@@ -321,6 +321,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--embedder", help="覆盖身份特征名。")
     parser.add_argument("--min-face-height", type=float, help="覆盖人脸高度占比下限。")
     parser.add_argument(
+        "--frontal-weight", type=float, metavar="W",
+        help="正脸分在代表图擂台里的权重（0=关）。与画风路由兼容：会同时压到每个 profile 上。",
+    )
+    parser.add_argument(
+        "--min-frontal", type=float, metavar="S",
+        help="正脸硬门槛：分数低于 S 的人脸框直接丢弃（0=关）。",
+    )
+    parser.add_argument(
+        "--min-track-seconds", type=float, metavar="S",
+        help="最短出镜时长（秒）：短于 S 的轨迹整条丢弃（0=关）。对应人工标注的「出镜 >1s」口径。",
+    )
+    parser.add_argument(
         "--eyes", type=int, metavar="N",
         help="覆盖正脸过滤门槛（人脸上至少 N 只眼）。默认 0=关闭；传 2 可复现对照实验。",
     )
@@ -342,6 +354,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.min_face_height_ratio = args.min_face_height
     if args.eyes is not None:
         config.require_eyes = args.eyes
+    if args.frontal_weight is not None:
+        set_frontal_weight(config, args.frontal_weight)
+    if args.min_frontal is not None:
+        config.min_frontal_score = args.min_frontal
+    if args.min_track_seconds is not None:
+        config.min_track_seconds = args.min_track_seconds
     if args.no_style_routing:
         config.style_routing = False
 

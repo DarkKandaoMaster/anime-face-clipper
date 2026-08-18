@@ -21,6 +21,10 @@ class StyleProfile:
         embedder: embedders.py 里注册的身份特征名。
         identity_threshold: 两条轨迹的代表图差异低于它就算同一个人。
         crop_margin: 代表裁剪图相对人脸框的外扩比例（ArcFace 走对齐，不看它）。
+        frontal_weight: 正脸分在代表图擂台里的权重（见 Config.frontal_weight）。
+            也是按画风走的：真人/3D 走关键点几何（零成本、连续可信），
+            2D 走动漫眼检测（要多跑一次推理，且闭眼/遮挡时哑火），两条支路的
+            分数可信度不同，权重没有理由取同一个值。
         min_face_height_ratio: 人脸框高度占画面高度的下限。这个也必须跟着
             检测器走：动漫脸 YOLO 的框连着大半个头，SCRFD 的框只到眉毛~下巴，
             同一张脸后者的框明显更矮，共用一个比例会让真人素材放进大量
@@ -32,6 +36,7 @@ class StyleProfile:
     identity_threshold: float
     crop_margin: float
     min_face_height_ratio: float
+    frontal_weight: float = 0.0
 
 
 @dataclasses.dataclass
@@ -86,6 +91,17 @@ class Config:
     require_eyes: int = 0
     # 眼睛检测的置信度门槛（imgutils.detect.detect_eyes）。
     eye_conf_threshold: float = 0.3
+    # 正脸分（frontal.py，[0,1]）在代表图擂台里的权重：
+    # 擂台分 = blur_var × confidence × (1 - w + w × frontal)。
+    # 0 = 完全关闭（连正脸推理都不跑，退化回纯清晰度擂台）；1 = 完全由正脸分缩放。
+    #
+    # 这是正脸判定的**主用法**，和旧的 require_eyes 有本质区别：它一条轨迹都不丢，
+    # 只改「这条轨迹送哪一张脸去聚类」。README 第六之二节里 require_eyes 的亏损
+    # 来自整条轨迹被筛掉（某个角色可能全片只有侧脸出镜），加权不会有这个代价。
+    frontal_weight: float = 0.0
+    # 正脸硬门槛：分数低于它的检测框直接丢掉。0 = 关闭。
+    # 默认关，理由同上；留着是为了能扫出「加权 vs 硬筛」的对照曲线。
+    min_frontal_score: float = 0.0
 
     # === 跟踪（IoU + 镜头切换断轨）===
     # 相邻帧 IoU 大于等于该值时，将检测结果连接为同一条轨迹。
@@ -103,6 +119,22 @@ class Config:
     # 多出来的两张没带来新视角，中位数反而抬高了同一角色之间的距离。
     # 要复现该对照把它改成 3。
     crops_per_track: int = 1
+
+    # 一条轨迹的最短出镜时长（秒），短于它的轨迹在跟踪结束后整条丢弃。0 = 关闭。
+    # 这条门槛直接对应**人工标注的口径**（"出镜 >1 秒"才算一个主体），而流水线
+    # 此前完全没有实现它：实测 `魔女之旅` 整集 788 条轨迹里，**中位轨迹只有 1 个
+    # 采样帧**、54% 短于两帧——一闪而过的脸各自成为一个"角色"，是片长尺度上
+    # 角色数虚高的主要来源之一。
+    # 时长按 end_time - start_time 算，所以 n 个采样帧的轨迹时长是 (n-1)×frame_interval。
+    min_track_seconds: float = 0.0
+
+    # 多张代表图之间至少相隔这么多个采样帧。0 = 不作要求（原行为）。
+    # 动机：擂台按 blur_var × confidence 取前 K 名，而这 K 名往往来自**相邻几帧**
+    # ——内容高度冗余，等于把同一张脸算了 K 遍。中位数聚合因此拿不到新视角，
+    # 实测 crops_per_track=3 在完整片源上反而更差（魔女之旅 54 → 60 个角色）。
+    # 要求时间上分开，前 K 名才是真正的多视角（不同光照、不同角度）。
+    # 只在 crops_per_track > 1 时有意义。
+    crop_min_gap_frames: int = 0
 
     # === 画风路由 ===
     # 关闭后所有素材共用下面的 detector / embedder / identity_threshold。
@@ -151,3 +183,17 @@ class Config:
     # === 外部工具 ===
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
+
+
+def set_frontal_weight(config: Config, weight: float) -> None:
+    """把正脸权重同时压到全局字段和每个画风 profile 上（就地修改）。
+
+    单独一个函数是因为画风路由会用 profile 覆盖全局字段（见 style.apply_style），
+    只改 Config.frontal_weight 的话，路由一开就被 profile 的值盖掉，命令行覆盖
+    会静默失效。做 A/B 时必须两边一起改。
+    """
+    config.frontal_weight = weight
+    config.style_profiles = {
+        name: dataclasses.replace(profile, frontal_weight=weight)
+        for name, profile in config.style_profiles.items()
+    }

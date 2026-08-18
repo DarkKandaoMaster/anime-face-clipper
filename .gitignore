@@ -1,8 +1,5 @@
 /data/
-/output/
-/output_eyes/
-/output_noeyes/
-/output_routed/
+/output*/
 __pycache__/
 自动化识别项目不可行性说明.doc
 自动化识别项目不可行性说明.docx

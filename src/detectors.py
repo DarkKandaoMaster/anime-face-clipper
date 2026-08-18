@@ -33,8 +33,11 @@ class Detection:
         confidence: 检测器置信度，范围为 ``[0, 1]``。
         label: 检测类别（例如 ``"anime_face"``）。
         blur_var: 裁剪图的拉普拉斯方差；由过滤阶段填充。
-        num_eyes: 裁剪图上检出的眼睛数，由过滤阶段填充（正脸判定）。None 表示没算过
-            （关闭了正脸过滤，或这张脸在更便宜的门槛上就被刷掉了）。
+        num_eyes: 裁剪图上检出的眼睛数，由过滤阶段填充（旧的 require_eyes 硬门槛）。
+            None 表示没算过（关闭了该门槛，或这张脸在更便宜的门槛上就被刷掉了）。
+        frontal: 正脸分 [0, 1]（见 frontal.py），由过滤阶段填充。None 表示没算过
+            （frontal_weight 与 min_frontal_score 都为 0）。跟踪阶段用它给
+            代表图擂台加权——非正脸的身份特征最不可靠。
         landmarks: 5 点关键点（左眼、右眼、鼻、左嘴角、右嘴角）的 (5, 2) 数组，
             只有能给出关键点的检测器才填（真人 SCRFD 填，动漫脸 YOLO 不填）。
             用于把脸对齐到 ArcFace 的标准姿态——不对齐的话人脸识别特征会失真。
@@ -51,6 +54,7 @@ class Detection:
     label: str
     blur_var: Optional[float] = None
     num_eyes: Optional[int] = None
+    frontal: Optional[float] = None
     landmarks: Optional["object"] = None
     crop: Optional["object"] = None
 
@@ -97,6 +101,23 @@ class Detector(abc.ABC):
         流式约束：必须在检测的当帧调用，帧一丢就没有第二次机会回头读像素。
         """
         return crop_bbox(image_bgr, expand_bbox(det.bbox, self._config.crop_margin))
+
+    def frontal_score(self, crop_bgr: np.ndarray, det: Detection) -> float:
+        """这张脸有多「正」，返回 [0, 1]（见 frontal.py 的动机与用法）。
+
+        和 :meth:`make_crop` 一样挂在检测器上：正脸的判据和检测器绑死——真人
+        SCRFD 顺带给了 5 点关键点可以纯几何算，动漫脸 YOLO 只有框，得另外
+        跑一次动漫眼检测。默认实现返回 1.0（未知不惩罚），让没实现它的检测器
+        的排序退化回原来的清晰度擂台。
+
+        流式约束：必须在检测的当帧、拿着紧贴人脸框的裁剪图时算完。
+
+        参数：
+            crop_bgr: 紧贴人脸框的 BGR 裁剪图（未按 crop_margin 外扩——外扩后
+                会把旁边那张脸的五官也框进来）。
+            det: 对应的检测结果（关键点支路从这里取 landmarks）。
+        """
+        return 1.0
 
     @abc.abstractmethod
     def detect(self, image, frame_index: int, time: float) -> List[Detection]:
@@ -163,6 +184,28 @@ def get_detector(name: str, config: Config) -> Detector:
 _detect_eyes = None
 
 
+def detect_eye_boxes(crop_bgr, config: Config):
+    """在人脸裁剪图上跑动漫眼检测，返回 [(bbox, label, score), ...]。
+
+    正脸判定的原料。位置比个数信息量大得多（见 frontal.frontal_from_eyes），
+    因此这里交出原始框，由调用方决定是数个数还是算几何。
+
+    流式约束：必须在检测的当帧、拿着裁剪图时就跑完，帧一丢就没有第二次机会。
+    """
+    global _detect_eyes
+    if _detect_eyes is None:
+        # 延迟导入：模型较重，且只有开启正脸判定时才需要。
+        from imgutils.detect import detect_eyes
+
+        _detect_eyes = detect_eyes
+    if crop_bgr is None or crop_bgr.size == 0:
+        return []
+    from PIL import Image
+
+    image = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+    return _detect_eyes(image, conf_threshold=config.eye_conf_threshold)
+
+
 def count_eyes(crop_bgr, config: Config) -> int:
     """数一张人脸裁剪图上能检出几只眼睛。
 
@@ -179,19 +222,7 @@ def count_eyes(crop_bgr, config: Config) -> int:
     返回：
         检出的眼睛数量；裁剪图为空时返回 0。
     """
-    global _detect_eyes
-    if _detect_eyes is None:
-        # 延迟导入：模型较重，且只有开启正脸过滤时才需要。
-        from imgutils.detect import detect_eyes
-
-        _detect_eyes = detect_eyes
-    if crop_bgr is None or crop_bgr.size == 0:
-        return 0
-    import cv2
-    from PIL import Image
-
-    image = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-    return len(_detect_eyes(image, conf_threshold=config.eye_conf_threshold))
+    return len(detect_eye_boxes(crop_bgr, config))
 
 
 # === imgutils 动漫脸检测器 ===
@@ -233,6 +264,14 @@ class AnimeFaceImgutils(Detector):
             )
             for bbox, _label, score in results
         ]
+
+    def frontal_score(self, crop_bgr: np.ndarray, det: Detection) -> float:
+        """动漫脸没有关键点，用动漫眼检测器的框位置算（见 frontal.frontal_from_eyes）。"""
+        from frontal import frontal_from_eyes
+
+        if crop_bgr is None or crop_bgr.size == 0:
+            return 0.0
+        return frontal_from_eyes(detect_eye_boxes(crop_bgr, self._config), crop_bgr.shape[1])
 
     def actual_providers(self) -> Optional[List[str]]:
         # 访问 imgutils 缓存的 ONNX session，读取真实 providers。
@@ -381,6 +420,12 @@ class RealFaceScrfd(Detector):
             )
             for i in np.array(kept).reshape(-1)
         ]
+
+    def frontal_score(self, crop_bgr: np.ndarray, det: Detection) -> float:
+        """5 点关键点纯几何算偏航角，零推理成本（见 frontal.frontal_from_landmarks）。"""
+        from frontal import frontal_from_landmarks
+
+        return frontal_from_landmarks(det.landmarks)
 
     def make_crop(self, image_bgr: np.ndarray, det: Detection) -> Optional[np.ndarray]:
         """按 5 点关键点把脸仿射对齐到 ArcFace 的 112×112 标准姿态。"""
