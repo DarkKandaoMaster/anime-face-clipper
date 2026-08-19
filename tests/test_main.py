@@ -1,4 +1,4 @@
-"""iou / track_faces / _cluster_by_difference / select_segments 的单元测试。
+r"""iou / track_faces / _cluster_by_difference / select_segments 的单元测试。
 
 这些函数都是纯计算，不触碰 ffmpeg、检测器模型或磁盘，
 因此直接构造 Detection / Track / Config 即可覆盖核心分支。
@@ -19,9 +19,11 @@ from main import (
     IdentityIndex,
     Track,
     _cluster_by_difference,
+    count_characters,
     iou,
     select_segments,
     track_faces,
+    track_screen_seconds,
 )
 
 
@@ -36,14 +38,19 @@ def make_det(frame_index, time, bbox, label="anime_face", confidence=0.9):
     )
 
 
-def make_track(track_id, start_time, end_time=None, label="anime_face", character_id=None):
-    """构造一个最小可用的 Track（select_segments 只用时间区间和 character_id）。"""
+def make_track(track_id, start_time, end_time=None, label="anime_face", character_id=None,
+               num_dets=0):
+    """构造一个最小可用的 Track（select_segments 只用时间区间和 character_id）。
+
+    ``num_dets`` 只是凑够数量：出镜时长按「采样检测数 × frame_interval」算，
+    这些用例不关心检测框本身的内容。
+    """
     return Track(
         track_id=track_id,
         label=label,
         start_time=start_time,
         end_time=end_time if end_time is not None else start_time,
-        detections=[],
+        detections=[make_det(i, 0.0, (0, 0, 1, 1)) for i in range(num_dets)],
         character_id=character_id,
     )
 
@@ -394,7 +401,7 @@ class TestWindowScopedClustering:
 
     @pytest.fixture
     def index(self, tracks, diff):
-        return IdentityIndex(tracks, diff, 0.5)
+        return IdentityIndex(tracks, diff, 0.5, Config())
 
     def test_full_set_splits_into_three(self, index, tracks):
         # 全片口径：0.9 那条离群边把 0/1/2 拆成两簇，加上 3 共三个角色。
@@ -418,7 +425,7 @@ class TestWindowScopedClustering:
             track.character_id = cid
         tracks[1].character_id = 1  # 模拟全片口径把 10/11 拆开
         base = Config(window_seconds=5.0, frame_interval=1.0, min_events_per_window=3)
-        index = IdentityIndex(tracks, diff, 0.5)
+        index = IdentityIndex(tracks, diff, 0.5, Config())
 
         video_scope = dataclasses.replace(base, cluster_scope="video")
         segments, _ = select_segments(tracks, 5.0, video_scope, None, index)
@@ -436,3 +443,46 @@ class TestWindowScopedClustering:
                         min_events_per_window=2, cluster_scope="window")
         segments, _ = select_segments(tracks, 5.0, config, None, None)
         assert segments and segments[0]["character_count"] == 3
+
+
+# === 累计出镜时长门槛（按角色算）===
+
+class TestCountCharacters:
+    """count_characters：按 label 分组累计出镜时长，只数达标的组。
+
+    这条门槛必须按**角色**算而不是按轨迹算——轨迹被切镜强制打断，一个角色
+    演满 3 秒中间切两刀就是 3 条各 1 秒的轨迹。
+    """
+
+    def test_screen_seconds_counts_samples_not_span(self):
+        # 单帧轨迹的 end-start 是 0，但它实际占了一个采样间隔。
+        track = make_track(1, 5.0, 5.0, num_dets=1)
+        assert track_screen_seconds(track, Config(frame_interval=0.3)) == pytest.approx(0.3)
+
+    def test_disabled_counts_distinct_labels(self):
+        config = Config(min_character_seconds=0.0, frame_interval=0.3)
+        tracks = [make_track(i, 0.0, num_dets=1) for i in range(3)]
+        assert count_characters(tracks, [0, 0, 1], config) == 2
+
+    def test_short_lived_character_dropped(self):
+        # 角色 1 只有 1 个采样帧 = 0.3s，够不上 1.0s 门槛。
+        config = Config(min_character_seconds=1.0, frame_interval=0.3)
+        tracks = [make_track(0, 0.0, num_dets=4), make_track(1, 1.0, num_dets=1)]
+        assert count_characters(tracks, [0, 1], config) == 1
+
+    def test_split_tracks_of_one_character_accumulate(self):
+        # 同一角色被切镜拆成 3 条各 0.6s 的轨迹，累计 1.8s，应当保留——
+        # 这正是按轨迹算的 min_track_seconds 会误杀的情形。
+        config = Config(min_character_seconds=1.0, frame_interval=0.3)
+        tracks = [make_track(i, float(i), num_dets=2) for i in range(3)]
+        assert count_characters(tracks, [7, 7, 7], config) == 1
+
+    def test_index_count_applies_gate(self):
+        # 差异矩阵把两条轨迹判成同一角色，但累计时长不够，窗口口径应数出 0。
+        import numpy as np
+
+        diff = np.zeros((2, 2))
+        tracks = [make_track(1, 0.0, num_dets=1), make_track(2, 0.5, num_dets=1)]
+        config = Config(min_character_seconds=1.0, frame_interval=0.3)
+        assert IdentityIndex(tracks, diff, 0.5, config).count(tracks) == 0
+        assert IdentityIndex(tracks, diff, 0.5, Config()).count(tracks) == 1

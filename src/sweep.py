@@ -108,7 +108,7 @@ def sweep_video(
         num_characters = len(set(labels))
         # 窗口口径的聚类也要跟着阈值走，所以索引在阈值循环里重建（只是包一层，
         # 差异矩阵本身仍然只算了一次）。
-        identity = IdentityIndex(candidates, diff_matrix, threshold)
+        identity = IdentityIndex(candidates, diff_matrix, threshold, config)
         for min_events in min_events_values:
             probe = dataclasses.replace(config, min_events_per_window=min_events)
             segments, num_qualified = select_segments(

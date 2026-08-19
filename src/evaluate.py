@@ -43,6 +43,7 @@ from config import Config, set_frontal_weight
 from groundtruth import GroundTruth, parse_ground_truth
 from main import (
     _cluster_by_difference,
+    count_characters,
     compute_differences,
     force_utf8_stdout,
     get_detector,
@@ -98,9 +99,16 @@ def evaluate_one(
     tracks,
     cuts: List[float],
     identity_threshold: float,
+    config: Config,
 ) -> Dict:
-    """给定一组已聚类的轨迹，算出这一格的全部指标。"""
-    pred_characters = len({t.character_id for t in tracks if t.character_id is not None})
+    """给定一组已聚类的轨迹，算出这一格的全部指标。
+
+    角色数走 ``count_characters``，因此 ``config.min_character_seconds``（按角色
+    算的累计出镜时长门槛）在这里生效。素材本身就是 30 秒 = 一个窗口，所以这里
+    的口径与 select_segments 里的窗口口径一致。
+    """
+    known = [t for t in tracks if t.character_id is not None]
+    pred_characters = count_characters(known, [t.character_id for t in known], config)
     shot_faces = characters_per_shot(tracks, cuts)
     pred_faces = sum(shot_faces)
 
@@ -154,7 +162,12 @@ def evaluate_video(
     os.makedirs(out_dir, exist_ok=True)
 
     style_pred, votes = "-", {}
-    if config.style_routing:
+    if config.force_style:
+        style_pred, votes = config.force_style, {"forced": True}
+        config = apply_style(config, style_pred)
+        print(f"[{gt.stem[:20]}] 画风人工指定：{style_pred}（真值 {gt.style}）"
+              f" -> {config.detector} + {config.embedder}")
+    elif config.style_routing:
         style_pred, votes = classify_style(video_path, config)
         config = apply_style(config, style_pred)
         print(f"[{gt.stem[:20]}] 画风判别：{style_pred}（真值 {gt.style}，票数 {votes}）"
@@ -169,7 +182,7 @@ def evaluate_video(
         print(f"[{gt.stem[:20]}] 没有任何代表裁剪图，全部角色都漏了。")
         return [
             {
-                **evaluate_one(gt, tracks, cuts, threshold or 0.0),
+                **evaluate_one(gt, tracks, cuts, threshold or 0.0, config),
                 "style_pred": style_pred,
             }
             for threshold in (threshold_values or [None])
@@ -183,7 +196,7 @@ def evaluate_video(
         labels = _cluster_by_difference(diff_matrix, threshold)
         for track, label in zip(candidates, labels):
             track.character_id = label
-        row = evaluate_one(gt, tracks, cuts, threshold)
+        row = evaluate_one(gt, tracks, cuts, threshold, config)
         row["style_pred"] = style_pred
         rows.append(row)
     return rows
@@ -330,7 +343,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--min-track-seconds", type=float, metavar="S",
-        help="最短出镜时长（秒）：短于 S 的轨迹整条丢弃（0=关）。对应人工标注的「出镜 >1s」口径。",
+        help="最短出镜时长（秒）：短于 S 的轨迹整条丢弃（0=关）。按轨迹算，已实测有害。",
+    )
+    parser.add_argument(
+        "--min-character-seconds", type=float, metavar="S",
+        help="按**角色**算的最短累计出镜时长（秒），聚类之后生效（0=关）。对应标注口径「出镜 >1s」。",
     )
     parser.add_argument(
         "--eyes", type=int, metavar="N",
@@ -339,6 +356,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--no-style-routing", action="store_true", help="关掉画风路由，所有素材共用一个阈值。"
     )
+    parser.add_argument("--style", choices=["2d", "3d", "real"],
+                        help="人工指定画风 profile，跳过自动判别。")
     args = parser.parse_args(argv)
 
     config = Config()
@@ -360,8 +379,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.min_frontal_score = args.min_frontal
     if args.min_track_seconds is not None:
         config.min_track_seconds = args.min_track_seconds
+    if args.min_character_seconds is not None:
+        config.min_character_seconds = args.min_character_seconds
     if args.no_style_routing:
         config.style_routing = False
+    if args.style is not None:
+        config.force_style = args.style
 
     threshold_values = _parse_floats(args.threshold) if args.threshold else None
 

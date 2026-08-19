@@ -106,13 +106,25 @@ def classify_style(video_path: str, config: Config) -> Tuple[str, Dict[str, obje
     if non_2d * 2 <= sum(votes.values()):
         return STYLE_2D, {"votes": votes}
 
-    # 非 2D：再分 3D CG 与真人。两者的 ArcFace 最优阈值差得远
-    # （3D ≈0.85、真人 ≈1.05），共用一个会把非 2D 的 F1 从 ~0.97 压到 ~0.83。
+    # 非 2D：再分 3D CG 与真人。两者只差 min_face_height_ratio 一个数
+    # （0.045 / 0.09），但那一个数值 4 分（非 2D 的 F1 0.95 vs 合并后的 0.82），
+    # 所以这一步不能省。**但它也修不好**，见下面的 warning。
     anime_evidence = _detector_evidence(images, "anime_face_imgutils", config)
     real_evidence = _detector_evidence(images, "real_face_scrfd", config)
     ratio = anime_evidence / real_evidence if real_evidence > 0 else float("inf")
     style = STYLE_REAL if ratio < config.style_real_evidence_ratio else STYLE_3D
-    return style, {"votes": votes, "evidence_ratio": round(ratio, 2)}
+    evidence = {"votes": votes, "evidence_ratio": round(ratio, 2)}
+    low, high = config.style_ambiguous_band
+    if low <= ratio <= high:
+        evidence["ambiguous"] = True
+        print(
+            f"[style] ⚠ 证据比 {ratio:.2f} 落在 3D CG 与真人的重叠区 [{low}, {high}]，"
+            f"判成 {style} 只是取了个门槛，很可能是错的。"
+            f"错了的后果是 min_face_height_ratio 用错一档（"
+            f"real=0.09 / 3d=0.045），角色数会整体偏高或偏低。"
+            f"知道答案就直接传 --style real 或 --style 3d。"
+        )
+    return style, evidence
 
 
 def apply_style(config: Config, style: str) -> Config:

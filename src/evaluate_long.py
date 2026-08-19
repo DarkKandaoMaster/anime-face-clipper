@@ -48,6 +48,7 @@ from groundtruth import GroundTruth, parse_ground_truth
 from main import (
     IdentityIndex,
     _characters_in_window,
+    count_characters,
     _cluster_by_difference,
     compute_differences,
     force_utf8_stdout,
@@ -103,19 +104,26 @@ def scan_once(config: Config, video_path: str, out_dir: str, style: str,
     labels = _cluster_by_difference(diff, threshold)
     for track, label in zip(candidates, labels):
         track.character_id = label
-    index = IdentityIndex(candidates, diff, threshold)
+    index = IdentityIndex(candidates, diff, threshold, config)
     return tracks, duration, cuts, index, config, len(set(labels))
 
 
-def count_in_window(tracks, index, start: float, window: float) -> Dict[str, int]:
-    """同一个窗口在两种聚类口径下各数出几个角色。"""
+def count_in_window(tracks, index, start: float, window: float,
+                    config: Config) -> Dict[str, int]:
+    """同一个窗口在两种聚类口径下各数出几个角色。
+
+    两种口径都过一遍 ``config.min_character_seconds``（累计出镜时长门槛），
+    否则这一列与 select_segments 的口径对不上。
+    """
     ordered = sorted(tracks, key=lambda tr: tr.start_time)
     starts = [tr.start_time for tr in ordered]
-    ids, overlapping = _characters_in_window(ordered, starts, start, window)
+    _ids, overlapping = _characters_in_window(ordered, starts, start, window)
     if index is None:
         return {"video": 0, "window": 0, "tracks": len(overlapping)}
     # 全片口径 = 这些轨迹在全片聚类里分属几个簇（character_id 由调用方预先写好）。
-    return {"video": len(ids), "window": index.count(overlapping),
+    known = [tr for tr in overlapping if tr.character_id is not None]
+    return {"video": count_characters(known, [tr.character_id for tr in known], config),
+            "window": index.count(overlapping),
             "tracks": len(overlapping)}
 
 
@@ -198,12 +206,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-clip-baseline", action="store_true",
                         help="跳过 30 秒切片参照列（省 9 次小扫描）。")
     parser.add_argument("--min-events", type=int, help="覆盖 min_events_per_window。")
+    parser.add_argument("--min-character-seconds", type=float, metavar="S",
+                        help="按角色算的最短累计出镜时长（秒），聚类之后生效（0=关）。")
     args = parser.parse_args(argv)
 
     base = Config()
     base.style_routing = False  # 画风用真值，理由见模块文档
     if args.min_events is not None:
         base.min_events_per_window = args.min_events
+    if args.min_character_seconds is not None:
+        base.min_character_seconds = args.min_character_seconds
 
     pairs = find_pairs(args.clip_dir, args.source_dir)
     if args.titles:
@@ -244,7 +256,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         for gt in sorted(gts, key=lambda g: g.source_offset):
             counts = count_in_window(tracks, index, float(gt.source_offset),
-                                     config.window_seconds)
+                                     config.window_seconds, config)
             row = {
                 "window_id": f"{title}_{gt.source_offset}s",
                 "style": style,

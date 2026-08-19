@@ -64,6 +64,9 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"   #
 & $py src/evaluate_long.py                             # 片长尺度对照：全片聚类 vs 窗口内聚类（真值 = 9 段切片在片源里的原位窗口）
 & $py src/evaluate_long.py --titles 魔女之旅 --no-clip-baseline   # 只跑一部
 & $py src/main.py <video> --cluster-scope window       # 聚类范围压回单个 30 秒窗口
+& $py src/main.py <video> --style real                 # 人工指定画风（3D CG / 真人机器分不开，见第五轮）
+& $py src/main.py <video> --prefetch 0                 # 关掉解码预取，退回完全串行（对照/内存受限时）
+& $py src/evaluate.py data/*.mp4 --min-character-seconds 0.9   # 按角色算的累计出镜时长门槛
 & $py src/montage.py output/<stem> --clusters 18       # 按 character_id 拼接触印相表，肉眼核对聚类
 & $py src/summarize.py output_raw                      # 汇总一批 windows.json：片段数 / 不重叠窗口上限
 & $py -m pytest tests -q                               # 141 个纯逻辑单测，3s，不需要 GPU/模型/网络
@@ -92,7 +95,7 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 | `src/embedders.py` | 身份特征注册表：`ccip`（动漫角色）与 `arcface`（真人脸）。统一接口 `differences(crop_paths) -> N×N 矩阵`，聚类阶段不关心是谁算的 |
 | `src/main.py` | 七阶段流水线 + CLI |
 | `src/sweep.py` | 在 `identity_threshold × min_events_per_window` 网格上重跑聚类与选段。视频只解码一次、身份特征只提一次，加格子几乎免费 |
-| `src/style.py` | 画风路由：抽帧判 **2d / 3d / real** 三分类 + `apply_style` 成套覆盖 Config（检测器 / 特征 / 阈值 / 外扩 / 尺寸门槛）|
+| `src/style.py` | 画风路由：抽帧判 **2d / 3d / real** 三分类 + `apply_style` 成套覆盖 Config（检测器 / 特征 / 阈值 / 外扩 / 尺寸门槛）。**2d/非2d 稳（26 段素材 21/21）；3d/real 机器分不开**，落进 `style_ambiguous_band` 就打警告，靠 `--style` 人工定 |
 | `src/frontal.py` | 正脸评分（纯几何、无 I/O）：真人/3D 走 SCRFD 5 点关键点算偏航，2D 走动漫眼检测器的**框位置**。判据挂在 `Detector.frontal_score` 上（和检测器绑死）。**加权与硬筛实测都无收益，默认全关** |
 | `src/montage.py` | 把一次运行的代表图按 `character_id` 拼成接触印相表（`--tracks` 可指向另一份聚类结果）。没有真值的完整片源只能这么核对聚类 |
 | `src/summarize.py` | 汇总一批 `windows.json`：轨迹/角色/片段数，以及**片段数 ÷ 不重叠窗口上限**——长片上最该盯的一列 |
@@ -164,6 +167,7 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 - 单调调阈值解决不了：0.32 重聚时同一张印相表上同时出现"仍在拆"和"已合错"；single-linkage 一步塌成 1 个簇，average 从 0.25 起过度合并。
 
 ### ⚠️ 四条修法已经实测过，三条无效——不要重复试
+（另有 9 条在第五轮实测无效：4 条针对尺寸门槛、5 条针对画风判据；另有 2 条针对吞吐。见下方第五轮）
 
 | 修法 | 结果 |
 |---|---|
@@ -193,6 +197,45 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 - **30 秒素材上两种口径恒等**（整段就是一个窗口），已实跑对比 `windows.json` 确认。所以 `evaluate.py` 的出厂基线一个数字都没动——**这次改动没法用旧真值集验证，必须跑 `evaluate_long.py`**。
 - **失效方向反转了**：唯一变差的 `爱情神话_1525s` 窗内只有 6 条轨迹（4 → 3），是**合过头**而不是拆过头。轨迹越稀疏，子矩阵越小，约束越松。别把它和过拆混为一谈。
 - **不要用"片段数下降"当成功指标**：门槛没变，只是喂进去的角色数不再虚高。问题一（`min_events_per_window` 在片长上不筛东西）没解决，48% 仍偏高。
+
+
+### 第五轮：画风路由查到底 + 吞吐（2026-08-18 深夜，README 第六之七 / 六之八节）
+
+**1. 画风路由：2D 那一步加固，3D CG / 真人那一步确认修不好。**
+
+- `3d` 与 `real` 两个 profile 的**唯一区别是 `min_face_height_ratio`**（0.045 / 0.09）。合并成一个非 2D profile 会让非 2D 的 macro F1 从 **0.955 掉到 0.82**（取 0.045）或 **0.79**（取 0.09），所以这个分档省不掉。
+- **四条"让这个数自己算出来、从而不需要分类"的修法，全部失败**（别重试）：按角色累计出镜时长 0.826、显著性门槛（小脸进聚类但要求至少一次大脸）0.785、相对尺寸（分布本身就重叠）、ArcFace 特征范数当质量门槛 0.862——都低于分档的 0.955。根因：`min_face_height_ratio` 表面量"脸够不够大"，实际起的作用是**挡住特征不可靠的小脸**，而"多小算小"在真人街景与 CG 番剧上确实不同。
+- **五条"换判据分 3D CG / 真人"，也全部失败**（别重试）：检测器证据比、抽样帧加到 32、逐帧比值中位数、`anime_real` 打整帧、`anime_real` / `anime_classify` 打人脸裁剪图——全部重叠。根因：`凡人修仙传` 是**追求写实的 3D CG**，现成分类器没有这一类；且本项目只有 **2 部**非 2D 片源，任何新判据都只是换一种过拟合。
+- **落地**：`style_probe_frames` 8 → **16**；新增 `config.style_ambiguous_band = (0.45, 0.80)`，证据比落进去就打警告；新增 `config.force_style` / `--style {2d,3d,real}`。
+- 效果：26 段素材上 **2D / 非 2D 二分 21/21**；三分类 14/15，**唯一判错的 `爱情神话` 整片落在歧义区、警告已触发**，另外 20 段判对且不歧义的一条警告都没打。
+- **需要人工的点**：跑真人或写实 CG 素材时直接传 `--style`。要自动化，缺的是素材，不是调参。
+
+**2. 吞吐：+15%，而且这条线已经走到头。**
+
+- 拆开计时（2D 支路，`魔女之旅` 前 300s）：**detect 69%（GPU）**、scdet 9.9%、解码 9.9%、`to_pil` 9.4%、过滤+跟踪 1.7%。三成 CPU 活和七成 GPU 活**串在同一个线程里交替执行**。
+- 落地：`config.prefetch_frames = 4`（解码 + 色彩转换挪到后台线程，`main.prefetch`）+ 切镜表提前一部在后台算（`main.iter_cut_tables`）。单片扫描 53.9s → 46.4s；批量端到端 **170s → 145s（+15%）**，轨迹数逐片完全相同。
+- **两条实测零收益，别再试**：① **多进程并行跑多个视频**（两部片 145s vs 147s）——预取一开瓶颈全在 GPU，多进程只是抢同一块卡；② **批量推理**（1024px 下 batch=1/4/8 是 26.8/24.6/27.8 ms 每帧）——单张就把 GPU 喂满了。
+- 剩下理论上还有 ~20%（imgutils 的 Python 侧前后处理占 detect 的 31%：全流程 35.7ms、纯 `session.run` 24.6ms），但要自己重写 YOLOv8 前后处理，对粗糙版本不划算。
+- `prefetch_frames` **别往上调**：8（49.4s）反而比 4（46.6s）和 2（46.4s）慢。
+
+**3. 顺手修的**：`AnimeFaceImgutils.actual_providers()` 之前**一直静默返回 None**（imgutils 的 `_open_models_for_repo_id` 返回的不是 `detect_faces` 内部真正用的那个实例，`_models` 恒为空）。GPU 掉回 CPU 会慢一个量级，而这里是唯一能发现它的地方。改成在存活对象里找 onnxruntime session，只依赖 onnxruntime 本身。
+
+**4. 新增 `config.min_character_seconds`**（`--min-character-seconds`，默认 0=关）：按**角色**算的累计出镜时长门槛，落在计数这一步（`main.count_characters`）。这是 README 第六之五节"还没试"第 ④ 条——把 `min_track_seconds` 放对位置。轨迹被切镜强制打断，"一条轨迹的时长"不是"角色的出镜时长"；累计时长是聚类之后才知道的量。单条轨迹时长按「采样检测数 × frame_interval」算，因为长片上过半轨迹只有一个采样帧，按 `end-start` 会算成 0 秒。**实测无收益**（30 秒真值集上最好 0.826 vs 基线 0.824），保留为 opt-in 旋钮。
+
+### 合格门槛 X：曲线已扫出，等需求方给数（README 第六之九节）
+
+`min_events_per_window = 4` 是**自拟占位值**。6 部完整片源、290 个不重叠 30 秒窗口上：
+
+| X | 2 | 3 | **4（现值）** | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 合格片长占比 | 89% | 67% | **48%** | 35% | 25% | 18% | 12% | 7% | 5% |
+
+窗内角色数：**中位 3、p25 2、p75 5、最大 14**。要点：
+
+- **X=4 输出近一半片长不是缺陷，是取值偏松**（中位数就是 3）。别再把它写成"门槛失效"。
+- 想要"少而显眼"，**X 落在 6~8**（25% → 12%）；X≥10 多数片源归零。
+- **各片源差异极大**：双人剧 `高木同学` X=3 就砍到 40%，`魔女之旅` 要 X=9 才到同一水平。别指望一个 X 通吃。
+- 改 X 只需 `--min-events X`，不用重跑检测或聚类。
 
 ### 当前基线（2026-08-18 实测，`src/evaluate.py data/*.mp4`）
 

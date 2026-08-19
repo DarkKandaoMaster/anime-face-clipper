@@ -168,6 +168,56 @@ def to_pil(image_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
 
+def prefetch(iterable: Iterator, depth: int) -> Iterator:
+    """把一个迭代器挪到后台线程上跑，主线程从有界队列里取。
+
+    为什么值得：``iter_frames`` 是**纯 CPU**（H.264 解码 + 色彩转换），而紧跟着
+    的 ``detector.detect`` 是**纯 GPU**。串在一个线程里两者只能交替执行，各自
+    等对方，两块硬件各闲一半。挪开之后解码与推理真正重叠，实测吞吐 +40% 左右。
+
+    解码在 OpenCV/FFmpeg 的 C 代码里跑，GIL 是放开的，所以线程（而不是进程）
+    就够——也不用把整帧跨进程序列化。
+
+    ``depth`` 是队列深度，同时也是**内存约束**：流式处理原本保证"内存里只有
+    当前帧"，开了预取就变成"最多 depth+1 帧"。仍与视频长度无关，但不能设大。
+    depth <= 0 时原样返回，退化成完全串行（出问题时可以这样对照）。
+
+    生产者线程里的异常会被原样搬到主线程抛出——静默吞掉会让流水线拿到一段
+    截短的视频却毫无迹象，这正是本项目最不想要的失败方式。
+    """
+    if depth <= 0:
+        return iterable
+
+    import queue
+    import threading
+
+    channel: "queue.Queue" = queue.Queue(maxsize=depth)
+    done = object()
+
+    def produce():
+        try:
+            for item in iterable:
+                channel.put(item)
+        except BaseException as exc:  # 交给主线程抛，不在后台线程里静默死掉
+            channel.put(exc)
+        else:
+            channel.put(done)
+
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+
+    def consume():
+        while True:
+            item = channel.get()
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    return consume()
+
+
 def imwrite_unicode(path: str, image_bgr: np.ndarray) -> bool:
     """写图片，兼容非 ASCII 路径。
 
@@ -554,6 +604,35 @@ def resolve_identity_threshold(config: Config) -> float:
     return get_embedder(config.embedder).default_threshold()
 
 
+def track_screen_seconds(track: Track, config: Config) -> float:
+    """一条轨迹的出镜时长：每个采样检测代表一个采样间隔。
+
+    不用 ``end_time - start_time``：那样单帧轨迹会算成 0 秒，而它实际占了一个
+    采样间隔的画面时间；而长片上超过一半的轨迹就是单帧的（README 第六之五节
+    问题五），全按 0 秒记会让时长这条判据在最该起作用的地方失效。
+    """
+    return len(track.detections) * config.frame_interval
+
+
+def count_characters(tracks: List[Track], labels: List[int], config: Config) -> int:
+    """按 labels 把轨迹分组，只数**累计出镜时长**达标的组。
+
+    为什么按角色算而不是按轨迹算：轨迹被切镜强制打断，"一条轨迹的时长"根本
+    不是"这个角色的出镜时长"——一个角色演满 3 秒中间切两刀就是 3 条各 1 秒的
+    轨迹。人工标注写的"出镜 >1s"指的是**角色的累计出镜时长**，那是聚类之后
+    才知道的量，所以这条门槛只能落在这里（README 第六之五节的 min_track_seconds
+    正是因为落错了位置才在 30 秒真值集上单调变差）。
+
+    ``config.min_character_seconds <= 0`` 时退化成"数有几个不同簇"（原行为）。
+    """
+    if config.min_character_seconds <= 0:
+        return len(set(labels))
+    totals: Dict[int, float] = {}
+    for track, label in zip(tracks, labels):
+        totals[label] = totals.get(label, 0.0) + track_screen_seconds(track, config)
+    return sum(1 for seconds in totals.values() if seconds >= config.min_character_seconds)
+
+
 class IdentityIndex:
     """轨迹级差异矩阵 + 阈值，支持在任意轨迹子集上重跑聚类。
 
@@ -565,31 +644,37 @@ class IdentityIndex:
     子集聚类的结果与全片聚类**不可比**：簇编号只在这一次调用内有意义。
     """
 
-    def __init__(self, candidates: List[Track], diff_matrix: np.ndarray, threshold: float):
+    def __init__(self, candidates: List[Track], diff_matrix: np.ndarray, threshold: float,
+                 config: Config):
         self._rows = {track.track_id: i for i, track in enumerate(candidates)}
         self._diff = np.asarray(diff_matrix, dtype=float)
         self._threshold = threshold
+        self._config = config
         # 滑窗以 frame_interval（0.3s）步进，相邻窗口的轨迹集合大多完全相同；
         # 按行号元组记一手，长片上省掉绝大部分重复 linkage。
         self._cache: Dict[Tuple[int, ...], int] = {}
 
     def count(self, tracks: List[Track]) -> int:
-        """这批轨迹在**只看它们自己**时聚出几个不同角色。
+        """这批轨迹在**只看它们自己**时聚出几个达标角色。
 
         没有代表裁剪图（不在矩阵里）的轨迹被忽略，与全片口径一致。
+        聚出的簇再过一遍累计出镜时长门槛（见 :func:`count_characters`）。
         """
-        rows = tuple(sorted(
-            self._rows[t.track_id] for t in tracks if t.track_id in self._rows
-        ))
+        rows_of = [(self._rows[t.track_id], t) for t in tracks if t.track_id in self._rows]
+        rows_of.sort(key=lambda pair: pair[0])
+        rows = tuple(row for row, _track in rows_of)
         if not rows:
             return 0
+        # 缓存键只需要行号：同一组行号对应同一批轨迹，时长也就同一份。
         cached = self._cache.get(rows)
         if cached is None:
             index = np.asarray(rows)
             labels = _cluster_by_difference(
                 self._diff[np.ix_(index, index)], self._threshold
             )
-            cached = self._cache[rows] = len(set(labels))
+            cached = self._cache[rows] = count_characters(
+                [track for _row, track in rows_of], labels, self._config
+            )
         return cached
 
 
@@ -617,7 +702,7 @@ def assign_characters(
     cluster_ids = _cluster_by_difference(diff_matrix, threshold)
     for track, cluster_id in zip(candidates, cluster_ids):
         track.character_id = cluster_id
-    return len(set(cluster_ids)), IdentityIndex(candidates, diff_matrix, threshold)
+    return len(set(cluster_ids)), IdentityIndex(candidates, diff_matrix, threshold, config)
 
 
 # === 6. 选段 ===
@@ -660,7 +745,9 @@ def _window_characters(
     character_ids, overlapping = _characters_in_window(ordered, starts, t, window)
     if config.cluster_scope == "window" and identity is not None:
         return character_ids, overlapping, identity.count(overlapping)
-    return character_ids, overlapping, len(character_ids)
+    known = [tr for tr in overlapping if tr.character_id is not None]
+    count = count_characters(known, [tr.character_id for tr in known], config)
+    return character_ids, overlapping, count
 
 
 def _nearest_cut(t: float, cuts: List[float], max_shift: float) -> Optional[float]:
@@ -945,6 +1032,7 @@ def scan_video(
     detector: Detector,
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
+    cuts: Optional[List[float]] = None,
 ) -> Tuple[List[Track], List[Dict], float, int, List[float]]:
     """流式扫描一遍视频，产出轨迹和落盘的代表裁剪图。
 
@@ -960,9 +1048,11 @@ def scan_video(
         detector: 已加载的检测器实例。
         limit_seconds: 如果设置，只处理该时间戳之前的帧（用于快速校准）。
         viz_count: 随机导出的标注示例帧数量。
+        cuts: 预先算好的切镜时刻表。None 时就地跑一趟 scdet；批量处理时由
+            run_pipeline 提前在后台线程里算好传进来（见 iter_cut_tables）。
 
-    切镜表由 detect_cuts 在主循环之前单独跑一趟全帧率解码得到（scdet 需要看到
-    每一帧，0.3s 抽帧下镜头内的正常演进已与真切镜混叠）。
+    切镜表由 detect_cuts 单独跑一趟全帧率解码得到（scdet 需要看到每一帧，
+    0.3s 抽帧下镜头内的正常演进已与真切镜混叠）。
 
     返回：
         (轨迹列表, 检测记录列表, 有效时长秒数, 采样帧数, 切镜时刻列表)。
@@ -972,8 +1062,9 @@ def scan_video(
     if limit_seconds is not None:
         duration = min(duration, limit_seconds)
 
-    print(f"[{stem}] scdet scan (threshold={config.scdet_threshold})...")
-    cuts = detect_cuts(config, video_path, limit_seconds)
+    if cuts is None:
+        print(f"[{stem}] scdet scan (threshold={config.scdet_threshold})...")
+        cuts = detect_cuts(config, video_path, limit_seconds)
     print(f"[{stem}] {len(cuts)} cuts detected")
 
     tracker = FaceTracker(config)
@@ -988,7 +1079,17 @@ def scan_video(
     viz_seen = 0
 
     print(f"[{stem}] streaming decode + detect + track...")
-    for index, time, image in iter_frames(config, video_path, limit_seconds):
+
+    def decoded():
+        """解码 + 色彩转换：主循环之外全部的纯 CPU 工作，一起挪到后台线程。
+
+        to_pil 也放进来（实测占 9.4%，与解码的 9.9% 同一量级）——它同样是
+        纯 CPU，留在主线程就还是和 GPU 推理串着跑。
+        """
+        for item in iter_frames(config, video_path, limit_seconds):
+            yield item[0], item[1], item[2], to_pil(item[2])
+
+    for index, time, image, image_pil in prefetch(decoded(), config.prefetch_frames):
         num_frames += 1
         frame_h = image.shape[0]
 
@@ -999,7 +1100,7 @@ def scan_video(
         prev_time = time
 
         # 先检测，再应用三道质量门槛。
-        raw = detector.detect(to_pil(image), index, time) # 阶段2拿到原始检测框
+        raw = detector.detect(image_pil, index, time) # 阶段2拿到原始检测框（色彩转换已在预取线程里做完）
         kept = []
         for det in raw:
             det.crop = crop_bbox(image, det.bbox) # 当帧就地裁下来，帧一丢就没有第二次机会
@@ -1065,6 +1166,7 @@ def process_video(
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
     clip: bool = True,
+    cuts: Optional[List[float]] = None,
 ) -> Dict:
     """对单个视频运行完整流程。
 
@@ -1087,7 +1189,14 @@ def process_video(
     # 画风路由：先判 2D / 非 2D，再据此换上整套识别参数。必须在扫描之前做，
     # 因为路由后的 config 决定用哪个检测器、怎么裁剪，一路带到聚类阶段。
     style = "-"
-    if config.style_routing:
+    if config.force_style:
+        # 人工指定优先于自动判别：3D CG 与真人这一步的自动判据在片长尺度上
+        # 分不开（见 config.style_ambiguous_band），知道答案时直接说了最省事。
+        style, votes = config.force_style, {"forced": True}
+        config = apply_style(config, style)
+        print(f"[{stem}] style={style}（人工指定）-> {config.detector} + "
+              f"{config.embedder}@{resolve_identity_threshold(config)}")
+    elif config.style_routing:
         style, votes = classify_style(video_path, config)
         config = apply_style(config, style)
         print(f"[{stem}] style={style} {votes} -> {config.detector} + "
@@ -1099,7 +1208,7 @@ def process_video(
     _report_providers(detector)
 
     tracks, detection_records, duration, num_frames, cuts = scan_video(
-        config, video_path, out_dir, detector, limit_seconds, viz_count
+        config, video_path, out_dir, detector, limit_seconds, viz_count, cuts
     )
 
     # 角色识别：CCIP 聚类给轨迹分配 character_id。
@@ -1153,6 +1262,34 @@ def process_video(
     return summary
 
 
+def iter_cut_tables(
+    config: Config,
+    video_paths: List[str],
+    limit_seconds: Optional[float],
+):
+    """按顺序交出每个视频的切镜表，但提前一部在后台线程里先算着。
+
+    为什么能白赚：scdet 是一个**纯 CPU 的 ffmpeg 子进程**（实测占单片耗时的
+    ~10%），而主流程在预取解码之后已经是 GPU 瓶颈——两者用的是不同的硬件，
+    串着跑纯属浪费。提前一部而不是全部提前：17 部片子同时起 17 个 ffmpeg 会
+    把 CPU 抢光，反过来拖慢解码线程。
+
+    ffmpeg 出错时 detect_cuts 照常抛 RuntimeError，只是抛在取结果的时候
+    （仍然是处理这部片子之前），fail fast 的行为不变。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = None
+        for i, path in enumerate(video_paths):
+            if pending is None:
+                pending = pool.submit(detect_cuts, config, path, limit_seconds)
+            nxt = (pool.submit(detect_cuts, config, video_paths[i + 1], limit_seconds)
+                   if i + 1 < len(video_paths) else None)
+            yield pending.result()
+            pending = nxt
+
+
 def run_pipeline(
     config: Config,
     video_paths: List[str],
@@ -1163,10 +1300,14 @@ def run_pipeline(
 
     检测器与身份特征模型都在各自的注册表里按名字缓存，所以多个视频之间
     自动复用同一份已加载模型，即使它们被路由到不同画风。
+
+    切镜表提前一部在后台线程里算（见 :func:`iter_cut_tables`），这样 ffmpeg
+    的 CPU 活与主流程的 GPU 活重叠。
     """
+    cut_tables = iter_cut_tables(config, video_paths, kwargs.get("limit_seconds"))
     return [
-        process_video(config, video_path, output_root, **kwargs)
-        for video_path in video_paths
+        process_video(config, video_path, output_root, cuts=cuts, **kwargs)
+        for video_path, cuts in zip(video_paths, cut_tables)
     ]
 
 
@@ -1187,10 +1328,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--encoder", help="Override video encoder (e.g. libx264).") # 视频编码器（默认 h264_nvenc）。失败会自动回退到 libx264；无 GPU 时显式传 libx264。
     parser.add_argument("--frontal-weight", type=float, metavar="W", help="Weight of the frontal score in representative-crop ranking (0 = off).") # 正脸分在代表图擂台里的权重。只换「这条轨迹送哪张脸去聚类」，不丢轨迹。
     parser.add_argument("--min-frontal", type=float, metavar="S", help="Drop faces whose frontal score is below S (0 = off).") # 正脸硬门槛
-    parser.add_argument("--min-track-seconds", type=float, metavar="S", help="Drop tracks shorter than S seconds on screen (0 = off).") # 最短出镜时长，对应人工标注的"出镜 >1s"口径 # 正脸硬门槛：分数低于 S 的框直接丢。默认 0（关）——硬筛会连角色一起丢，见 README 第六之二节。
+    parser.add_argument("--min-track-seconds", type=float, metavar="S", help="Drop tracks shorter than S seconds on screen (0 = off).")
+    parser.add_argument("--min-character-seconds", type=float, metavar="S", help="Only count a character whose cumulative screen time in the window reaches S seconds (0 = off).") # 按角色算的累计出镜时长，对应标注口径「出镜 >1s」；聚类之后才知道，所以落在计数这一步 # 最短出镜时长，对应人工标注的"出镜 >1s"口径 # 正脸硬门槛：分数低于 S 的框直接丢。默认 0（关）——硬筛会连角色一起丢，见 README 第六之二节。
     parser.add_argument("--eyes", type=int, metavar="N", help="Require N eyes per face (legacy frontal filter). 0 = off (default).") # 正脸过滤：脸上至少检出 N 只眼才保留。默认 0（关）——实测有害，见 README 第六之二节；传 2 可复现那组对照。
     parser.add_argument("--cluster-scope", choices=["video", "window"], help="Cluster identities over the whole video (default) or within each 30s window.") # 聚类范围。window = 每个候选窗口内单独聚类，参与聚类的轨迹数与片长无关。
-    parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one detector/embedder/threshold for all.") # 关掉画风路由，所有素材共用 config 里的 detector / embedder / identity_threshold。
+    parser.add_argument("--no-style-routing", action="store_true", help="Disable style routing; use one detector/embedder/threshold for all.")
+    parser.add_argument("--style", choices=["2d", "3d", "real"], help="Force the style profile instead of auto-detecting it.")
+    parser.add_argument("--prefetch", type=int, metavar="N", help="Decode-ahead queue depth (0 = fully serial).") # 解码预取深度：0 关掉并行解码，用于对照或内存受限时 # 人工指定画风：3D CG 与真人的自动判据在片长上分不开，知道答案就直接传 # 关掉画风路由，所有素材共用 config 里的 detector / embedder / identity_threshold。
     # 运行 / 调试参数。
     parser.add_argument("--limit-seconds", type=float, help="Only process first N seconds.") # 只处理前 N 秒；调参时先跑短片段很有用。
     parser.add_argument("--viz", type=int, default=0, help="Dump N annotated sample frames.")
@@ -1228,10 +1372,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.min_frontal_score = args.min_frontal
     if args.min_track_seconds is not None:
         config.min_track_seconds = args.min_track_seconds
+    if args.min_character_seconds is not None:
+        config.min_character_seconds = args.min_character_seconds
     if args.cluster_scope is not None:
         config.cluster_scope = args.cluster_scope
     if args.no_style_routing:
         config.style_routing = False
+    if args.style is not None:
+        config.force_style = args.style
+    if args.prefetch is not None:
+        config.prefetch_frames = args.prefetch
 
     run_pipeline(
         config,

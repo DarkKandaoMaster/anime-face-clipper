@@ -274,18 +274,32 @@ class AnimeFaceImgutils(Detector):
         return frontal_from_eyes(detect_eye_boxes(crop_bgr, self._config), crop_bgr.shape[1])
 
     def actual_providers(self) -> Optional[List[str]]:
-        # 访问 imgutils 缓存的 ONNX session，读取真实 providers。
-        # 这里依赖私有内部结构，因此用宽泛保护做尽力诊断。
-        try:
-            from imgutils.generic.yolo import _open_models_for_repo_id
+        """当前这个模型实际跑在哪些 provider 上（诊断用，确认有没有用上 GPU）。
 
-            model = _open_models_for_repo_id(_IMGUTILS_REPO_ID)
-            for cached in model._models.values():  # noqa: SLF001
-                session = cached[0]
-                return list(session.get_providers())
-        except Exception:  # pragma: no cover - 仅用于诊断
+        不走 imgutils 的私有缓存结构：``_open_models_for_repo_id`` 返回的
+        YOLOModel 实例与 ``detect_faces`` 内部真正用的那个不是同一个，
+        ``_models`` 恒为空，于是这个诊断**一直静默返回 None**——GPU 掉回 CPU
+        会慢一个量级，而这里正是唯一能发现它的地方，不能哑着。
+
+        改成在存活对象里找 onnxruntime 的 session：只依赖 onnxruntime 自身，
+        不随 imgutils 版本变。必须先跑过一次推理，否则模型还没加载。
+        """
+        import gc
+
+        try:
+            import onnxruntime
+        except ImportError:  # pragma: no cover - 仅用于诊断
             return None
-        return None
+        providers = {
+            tuple(obj.get_providers())
+            for obj in gc.get_objects()
+            if isinstance(obj, onnxruntime.InferenceSession)
+        }
+        if not providers:
+            return None
+        # 多个 session（检测 + 身份特征）时合并成一份去重列表：这里只回答
+        # "有没有用上 CUDA"，不区分是哪个模型。
+        return sorted({name for group in providers for name in group})
 
 
 # === 真人脸检测器（InsightFace SCRFD-10G）===
