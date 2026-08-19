@@ -48,4 +48,15 @@ README.md是旧版，关于里面提到的，比如模型缓存等问题，请�
 
 $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 $env:HF_HUB_OFFLINE = '1'
-& $py src/main.py (Get-ChildItem "data\原始数据\*.mp4").FullName --min-events 8 --output-dir output_x8
+& $py src/main.py (Get-ChildItem "data\原始数据\*.mp4").FullName --min-events 10 --output-dir output_x10
+
+
+
+
+
+
+把从批注开始，一直到结尾，改一下。别的地方也改一下。
+这份说明还没交上去，以原流程“人物检测 → 镜头内跟踪/关联 → 跨镜头身份去重 → 滑窗内唯一身份计数 → 存在性判断”为基准，说明一下我这个项目目前达到的效果。不要使用“批注”、“回复”、“本轮”等词。
+删改已过时的内容。
+一定要像 自动化识别项目不可行性说明.docx 那样克制、简短。不要过多使用md语法。
+请主要用表格、流程图来呈现。
