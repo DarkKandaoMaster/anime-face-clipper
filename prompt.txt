@@ -42,3 +42,10 @@ README.md是旧版，关于里面提到的，比如模型缓存等问题，请�
 
 你觉得怎么样？
 加上“如果人脸不是正脸（判定条件暂定为脸上没有出现两个眼睛），那么排除。”后，
+
+
+
+
+$py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
+$env:HF_HUB_OFFLINE = '1'
+& $py src/main.py (Get-ChildItem "data\原始数据\*.mp4").FullName --min-events 8 --output-dir output_x8
