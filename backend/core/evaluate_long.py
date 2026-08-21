@@ -24,9 +24,9 @@
 
 ## 怎么跑（项目根目录）
 
-    $py src/evaluate_long.py                     # 全部能配上对的片源
-    $py src/evaluate_long.py --titles 魔女之旅    # 只跑一部，快速验证
-    $py src/evaluate_long.py --no-clip-baseline  # 跳过 30 秒切片参照列
+    $py backend/core/evaluate_long.py                     # 全部能配上对的片源
+    $py backend/core/evaluate_long.py --titles 魔女之旅    # 只跑一部，快速验证
+    $py backend/core/evaluate_long.py --no-clip-baseline  # 跳过 30 秒切片参照列
 
 产出：控制台表格 + <output-dir>/long_scope.csv 与 long_films.csv。
 代价：每部片源解码一遍、身份特征提一次；两种口径共用同一份差异矩阵，

@@ -1,6 +1,6 @@
 # 半分钟窗口内主体计数 — 数据流程说明
 
-> 本文说明 `src/` 下这套代码的数据流向、各阶段处理逻辑，以及输入/输出。
+> 本文说明 `backend/core/` 下这套代码的数据流向、各阶段处理逻辑，以及输入/输出。
 
 ---
 
@@ -14,7 +14,7 @@
 
 判定标准：一个 `window_seconds` 窗口里如果**出现过 ≥ `min_events_per_window` 个不同角色**，就算合格片段。角色身份由身份特征模型对轨迹代表裁剪图做 complete-linkage 层次聚类得到；"出现过"指轨迹时间区间与窗口相交（包括窗口开始前就在画面中的角色），同一角色的多条轨迹只计一次。
 
-**按画风分三条支路**（[`style.py`](./src/style.py) 抽 8 帧判定，实测 9/9 判对），每条支路是一整套绑死的参数（[`config.StyleProfile`](./src/config.py)）：
+**按画风分三条支路**（[`style.py`](./backend/core/style.py) 抽 8 帧判定，实测 9/9 判对），每条支路是一整套绑死的参数（[`config.StyleProfile`](./backend/core/config.py)）：
 
 | 画风 | 检测器 | 身份特征 | 代表裁剪图 | 身份阈值 | 人脸高度下限 |
 |---|---|---|---|---:|---:|
@@ -24,7 +24,7 @@
 
 这四项必须成套换，拆开就会拼出无意义的组合：ArcFace 只在对齐脸上成立，CCIP 只在动漫角色图上成立，SCRFD 的框比动漫框矮一大截所以尺寸门槛不通用。
 
-入口链路（见 [`src/main.py`](./src/main.py)）：
+入口链路（见 [`backend/core/main.py`](./backend/core/main.py)）：
 
 ```
 main()  →  run_pipeline()  →  process_video()  →  scan_video()   ← 唯一的抽帧循环
@@ -45,11 +45,11 @@ main()  →  run_pipeline()  →  process_video()  →  scan_video()   ← 唯�
 |---|---|---|
 | 窗口长度 | `window_seconds = 15.0` | **30 秒**（需求口径就是 30 秒窗口，不再当可调参数） |
 | 合格门槛 | `min_events_per_window = 13` | **4**（9 段素材真值落在 4~11，取下界） |
-| 画风 | 单一模型 + 单套参数 | [`style.py`](./src/style.py) 抽 8 帧判 **2D / 3D CG / 真人** 三分类，整套换模型与参数。**9/9 判对** |
+| 画风 | 单一模型 + 单套参数 | [`style.py`](./backend/core/style.py) 抽 8 帧判 **2D / 3D CG / 真人** 三分类，整套换模型与参数。**9/9 判对** |
 | 真人 / 3D CG | 也用动漫脸 YOLO + CCIP（离分布） | **SCRFD-10G + ArcFace**，按关键点对齐 |
 | 正脸 | 不判断 | 已实现两代：`require_eyes`（数眼睛）与 `frontal.py` 的正脸分（关键点/眼框几何）。**加权与硬筛两种用法实测都无收益，默认关闭**——见第六之二、第六之四节 |
-| 验收 | 无 | [`evaluate.py`](./src/evaluate.py) 用文件名标注算召回，**macro 召回 0.98、macro F1 0.96** |
-| 长片实测 | 无 | [`montage.py`](./src/montage.py) + `--no-clip`，在 `data/原始数据/` 的完整片源上跑通并定位到瓶颈——**见第六之五节，这是当前最该改的地方** |
+| 验收 | 无 | [`evaluate.py`](./backend/core/evaluate.py) 用文件名标注算召回，**macro 召回 0.98、macro F1 0.96** |
+| 长片实测 | 无 | [`montage.py`](./backend/core/montage.py) + `--no-clip`，在 `data/原始数据/` 的完整片源上跑通并定位到瓶颈——**见第六之五节，这是当前最该改的地方** |
 
 下面第二~八节描述的是当前代码的行为；剩下的长期方向在第九节。
 
@@ -89,13 +89,13 @@ main()  →  run_pipeline()  →  process_video()  →  scan_video()   ← 唯�
 
 ```powershell
 $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
-& $py src/main.py "data/魔女之旅_760s（人脸数期望：2+5+1+0+3+1）（跨镜头身份去重后期望：9）.mp4" --min-events 5
-& $py src/main.py <video> --limit-seconds 60 --viz 8   # 调参：只跑前 60 秒 + 导出 8 张标注帧
-& $py src/sweep.py data/*.mp4                          # 阈值敏感性网格扫描 → output/sweep.csv
-& $py src/evaluate.py data/*.mp4                       # 召回率评估 → output/recall.csv
-& $py src/main.py <video> --no-clip                    # 只分析不编码片段（在长片上批量实测时用）
-& $py src/montage.py output/<stem>                     # 把结果按 character_id 拼成接触印相表，肉眼核对聚类
-& $py src/summarize.py output_raw                      # 汇总一批运行的产出概览（片段数 / 窗口上限）
+& $py backend/core/main.py "data/魔女之旅_760s（人脸数期望：2+5+1+0+3+1）（跨镜头身份去重后期望：9）.mp4" --min-events 5
+& $py backend/core/main.py <video> --limit-seconds 60 --viz 8   # 调参：只跑前 60 秒 + 导出 8 张标注帧
+& $py backend/core/sweep.py data/*.mp4                          # 阈值敏感性网格扫描 → output/sweep.csv
+& $py backend/core/evaluate.py data/*.mp4                       # 召回率评估 → output/recall.csv
+& $py backend/core/main.py <video> --no-clip                    # 只分析不编码片段（在长片上批量实测时用）
+& $py backend/core/montage.py output/<stem>                     # 把结果按 character_id 拼成接触印相表，肉眼核对聚类
+& $py backend/core/summarize.py output_raw                      # 汇总一批运行的产出概览（片段数 / 窗口上限）
 & $py -m pytest tests -q                               # 141 个纯逻辑单测，约 3 秒，不需要 GPU / 模型 / 网络
 ```
 
@@ -112,6 +112,7 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 | `detections.json` | 每个原始检测框一条记录（含 `kept` 是否通过过滤） |
 | `tracks.json` | 每条人脸轨迹一条记录（含 `character_id`） |
 | `windows.json` | 总摘要 + 选中片段 + 本次所用的全部参数 |
+| `windows_scan.json` | 每个候选窗口起点的角色数（与 X 无关的中间态），Web 端拖 X 靠它 |
 | `crops/track_<id>_<rank>.jpg` | 每条轨迹的代表裁剪图（`rank` 从 0 起，按清晰度降序，共 `crops_per_track` 张；默认 1 张） |
 | `clips/clip_<NNN>.mp4` | 切出的片段视频 |
 | `viz/sample_<NNN>.jpg` | 标注样本帧（全片蓄水池采样），仅 `--viz N` 时生成 |
@@ -158,7 +159,7 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 
 > 本节的绝对数量（2925 条检测、289 条轨迹、198 个角色……）来自已移除的 `data/1.mp4`（23 分钟整集），仅用于说明数据形态。
 
-### 阶段 0：画风路由 — `classify_style` / `apply_style`（[style.py](./src/style.py)）
+### 阶段 0：画风路由 — `classify_style` / `apply_style`（[style.py](./backend/core/style.py)）
 
 在任何解码之前先判画风，因为它决定后面用哪个检测器、怎么裁脸、拿什么特征聚类。均匀 seek 抽 `style_probe_frames=8` 帧，分两步判：
 
@@ -172,7 +173,7 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 
 代价：一次性小开销，实测 <1s/段（比主循环里跑 100 帧检测便宜一个量级）。seek 被吸附到关键帧对画风判断没有影响。
 
-### 阶段 1：流式解码 — `iter_frames`（[main.py](./src/main.py)）
+### 阶段 1：流式解码 — `iter_frames`（[main.py](./backend/core/main.py)）
 
 - 用 `cv2.VideoCapture` 顺序解码，按 `frame_interval=0.3` 采样，**产出内存中的 BGR 数组**，不写任何中间文件。
 - 用 `grab()`/`retrieve()` 而非 seek：长 GOP 的 H.264 上 seek 会被吸附到关键帧，既不准也不快。`grab()` 跳过不需要的帧的色彩转换与内存拷贝，`retrieve()` 只在命中采样点时才真正取出图像。
@@ -180,9 +181,9 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"
 - `--limit-seconds N` 在此处**停止解码**（而非解码完再过滤），调参时省下的是真实时间。
 - 打不开视频或拿不到有效 fps 时直接抛 `RuntimeError`，不静默产出空序列。
 
-### 阶段 2：检测 + 镜头切换标记 — `scan_video` 主循环（[main.py](./src/main.py)）
+### 阶段 2：检测 + 镜头切换标记 — `scan_video` 主循环（[main.py](./backend/core/main.py)）
 
-**(a) 镜头切换检测** — `detect_cuts`（[main.py](./src/main.py)）+ `_cut_between`（[main.py](./src/main.py)）
+**(a) 镜头切换检测** — `detect_cuts`（[main.py](./backend/core/main.py)）+ `_cut_between`（[main.py](./backend/core/main.py)）
 
 主循环开始之前，先用 ffmpeg 的 **`scdet` 滤镜**全帧率扫一趟，拿到一张切镜时刻表：
 
@@ -197,9 +198,9 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 - **阈值默认 10**：手绘作画素材上逐帧人工验证过（魔女之旅 9/9、EVA_1730 11/11 全真）。CG 动作素材（如凡人修仙传）在 10 上偏保守，用 `--scdet-threshold 5`。
 - 这一节替换掉了旧的 HSV 直方图方案，原因与实测数字见"七、值得注意的细节"第 8 条。
 
-**(b) 人脸检测** — `detector.detect`（[detectors.py](./src/detectors.py)）
+**(b) 人脸检测** — `detector.detect`（[detectors.py](./backend/core/detectors.py)）
 
-用哪个检测器由画风路由决定，两个实现都注册在 [`detectors.py`](./src/detectors.py) 的名字表里：
+用哪个检测器由画风路由决定，两个实现都注册在 [`detectors.py`](./backend/core/detectors.py) 的名字表里：
 
 | 名称 | 模型 | 用于 | 关键点 |
 |---|---|---|---|
@@ -221,9 +222,9 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 
   这个比值同时也是路由里"3D CG vs 真人"的判据，见第五节末。
 
-### 阶段 3：过滤 — 三道质量门槛 `passes_quality`（[main.py](./src/main.py)）
+### 阶段 3：过滤 — 三道质量门槛 `passes_quality`（[main.py](./backend/core/main.py)）
 
-对每个原始检测，先用 `crop_bbox`（[detectors.py](./src/detectors.py)）**当帧就地裁出脸**，再补 `blur_var = laplacian_variance(crop)`，然后过三关：
+对每个原始检测，先用 `crop_bbox`（[detectors.py](./backend/core/detectors.py)）**当帧就地裁出脸**，再补 `blur_var = laplacian_variance(crop)`，然后过三关：
 
 1. `confidence ≥ 0.5`（`conf_threshold`）
 2. 人脸框高度 `≥ min_face_height_ratio × 帧高`（丢弃太小/太远的脸；**按画风取值**：2D 0.03、3D CG 0.045、真人 0.09）
@@ -239,7 +240,7 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 - 2D：人脸框**外扩 `crop_margin=0.6` 倍**。CCIP 是按"角色图"训练的，而检测框紧贴五官——发型和发色（动漫角色身份最强的线索）恰好被裁在框外。实测把 2D 的 F1 从 0.91 抬到 0.95（同时把最优阈值从 0.178 推到 0.20）。
 - 3D CG / 真人：按 5 点关键点做**最小二乘相似变换**（Umeyama 闭式解）对齐到 ArcFace 的标准 112×112 姿态。不对齐直接喂裁剪图，人脸识别特征会明显退化。用闭式解而不是 `cv2.estimateAffinePartial2D`，是因为后者是 RANSAC/LMEDS 鲁棒估计，5 个点上不稳定也不可复现。
 
-**正脸分（可选，默认关）**：在换成代表裁剪图**之前**、还拿着紧贴人脸框的那张裁剪图时，`Detector.frontal_score` 会给这张脸打一个 `[0, 1]` 的"有多正"（[frontal.py](./src/frontal.py)）。判据和检测器绑死，两条支路完全不同：
+**正脸分（可选，默认关）**：在换成代表裁剪图**之前**、还拿着紧贴人脸框的那张裁剪图时，`Detector.frontal_score` 会给这张脸打一个 `[0, 1]` 的"有多正"（[frontal.py](./backend/core/frontal.py)）。判据和检测器绑死，两条支路完全不同：
 
 - **真人 / 3D CG**：SCRFD 顺带给了 5 点关键点，把坐标投影到"两眼连线"这条轴上，量鼻尖与嘴心相对两眼中点的横向偏移（除以两眼间距归一化）。正脸时两者都落在两眼中点上、偏移 ≈0，侧过头则一起向近侧滑。**零推理成本**，且对画面内的旋转与缩放都不敏感（人歪着头不算侧脸）。
 - **2D 动画**：动漫脸 YOLO 不给关键点，退而用动漫眼检测器的**框位置**（不是旧 `require_eyes` 的"数几只眼"）：两眼中心的水平间距占脸宽的比例是偏航角的直接代理，再乘上"两眼中点相对脸框中心的偏移"惩罚。代价是每张脸多跑一次 ONNX（实测整集耗时 +27%）。
@@ -254,11 +255,11 @@ ffmpeg -hide_banner -nostats -loglevel info -i <video> -an -vf scdet=threshold=1
 - **每个原始检测**（无论是否通过）都写入 `detection_records`，带 `kept: true/false` → 即 `detections.json`。
 - `--viz N` 用**蓄水池采样**从全片均匀抽 N 张标注帧；流式下不知道总帧数，且样本当场压成 JPEG 字节（≈200KB/张）才进池子，不留整帧（1080p ≈ 6MB/张）。
 
-### 阶段 4：跟踪 — `FaceTracker`（[main.py](./src/main.py)）+ `save_representatives`（[main.py](./src/main.py)）
+### 阶段 4：跟踪 — `FaceTracker`（[main.py](./backend/core/main.py)）+ `save_representatives`（[main.py](./backend/core/main.py)）
 
 把逐帧人脸框沿时间串成**轨迹（Track）**。一条轨迹 = 同一张脸的一次连续出现。
 
-跟踪器是**在线**的（`update()` 每帧调用一次），这是流式化的关键：代表裁剪图要挑"该轨迹内 `blur_var × confidence` 最大"的那张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那一帧，流式下帧已经丢了。于是改为**边跟踪边擂台**——每条活跃轨迹只留当前最好的 `crops_per_track`（默认 1）张裁剪图（`_offer`，[main.py](./src/main.py)），来了更好的就挤掉最差的，落选的立刻解引用。擂台分是
+跟踪器是**在线**的（`update()` 每帧调用一次），这是流式化的关键：代表裁剪图要挑"该轨迹内 `blur_var × confidence` 最大"的那张，而这在轨迹结束前无从判定。批处理版可以等全部跑完再回头读那一帧，流式下帧已经丢了。于是改为**边跟踪边擂台**——每条活跃轨迹只留当前最好的 `crops_per_track`（默认 1）张裁剪图（`_offer`，[main.py](./backend/core/main.py)），来了更好的就挤掉最差的，落选的立刻解引用。擂台分是
 
 ```
 blur_var × confidence × (1 - frontal_weight + frontal_weight × frontal)
@@ -268,24 +269,24 @@ blur_var × confidence × (1 - frontal_weight + frontal_weight × frontal)
 
 逐帧推进，核心逻辑：
 
-- **断轨**（[main.py](./src/main.py)）：某活跃轨迹丢帧超过 `track_gap_tolerance`（1 帧），**或**它最后一帧到当前帧之间发生了镜头切换，即封存（finalize）。切换标记用一个 `blocked` 标志在线传播，等价于批处理版回看 `is_cut[]` 区间。
+- **断轨**（[main.py](./backend/core/main.py)）：某活跃轨迹丢帧超过 `track_gap_tolerance`（1 帧），**或**它最后一帧到当前帧之间发生了镜头切换，即封存（finalize）。切换标记用一个 `blocked` 标志在线传播，等价于批处理版回看 `is_cut[]` 区间。
   → 这就是"镜头切换强制断轨"的来源：同一角色每次重新出场都是一条新轨迹（角色去重由阶段 5 负责）。
-- **贪心 IoU 匹配**（[main.py](./src/main.py)）：当前帧的框与活跃轨迹最后一个框算 IoU，`≥0.3`（`iou_threshold`）且 label 相同才能接上；按 IoU 从高到低贪心配对，每条轨迹/每个框只用一次，避免"一个框被两条轨迹抢"或"一条轨迹接两个框"。
-- **新轨迹**（[main.py](./src/main.py)）：未匹配任何轨迹的框，说明是一张新出现的脸，开一条新轨迹。
+- **贪心 IoU 匹配**（[main.py](./backend/core/main.py)）：当前帧的框与活跃轨迹最后一个框算 IoU，`≥0.3`（`iou_threshold`）且 label 相同才能接上；按 IoU 从高到低贪心配对，每条轨迹/每个框只用一次，避免"一个框被两条轨迹抢"或"一条轨迹接两个框"。
+- **新轨迹**（[main.py](./backend/core/main.py)）：未匹配任何轨迹的框，说明是一张新出现的脸，开一条新轨迹。
 
 封存的 Track 记录起止时间与所有成员检测，最后按 `start_time` 排序。
 
-`track_faces`（[main.py](./src/main.py)）是喂满整个列表的批处理入口，只给单测用；主流程直接逐帧调 `update()`。
+`track_faces`（[main.py](./backend/core/main.py)）是喂满整个列表的批处理入口，只给单测用；主流程直接逐帧调 `update()`。
 
 `save_representatives`：把跟踪时已选定的裁剪图写成 `crops/track_<id>_<rank>.jpg`，然后释放数组引用。写入前先清空目录，保证重跑幂等（换参数往往产生更少轨迹，留着上一轮的 `track_N.jpg` 会与 `tracks.json` 对不上）。
 
-- **中文路径**：落盘走 `imwrite_unicode`（[main.py](./src/main.py)）而非 `cv2.imwrite`。后者在 Windows 上按 ANSI 代码页处理路径，遇到中文目录名**静默返回 `False`**——中文片名的视频会导致所有裁剪图丢失、所有 `character_id` 变成 `None`、最终一个片段都选不出来。绕开方式是 `cv2.imencode` + `numpy.tofile`。**当前素材文件名全是中文，这条随时会踩。**
+- **中文路径**：落盘走 `imwrite_unicode`（[main.py](./backend/core/main.py)）而非 `cv2.imwrite`。后者在 Windows 上按 ANSI 代码页处理路径，遇到中文目录名**静默返回 `False`**——中文片名的视频会导致所有裁剪图丢失、所有 `character_id` 变成 `None`、最终一个片段都选不出来。绕开方式是 `cv2.imencode` + `numpy.tofile`。**当前素材文件名全是中文，这条随时会踩。**
 
-### 阶段 5：角色识别 — `assign_characters`（[main.py](./src/main.py)）+ `_cluster_by_difference`（[main.py](./src/main.py)）
+### 阶段 5：角色识别 — `assign_characters`（[main.py](./backend/core/main.py)）+ `_cluster_by_difference`（[main.py](./backend/core/main.py)）
 
 给每条轨迹一个**角色身份**（`character_id`），让后续选段能按"不同角色"去重计数。**这是全流水线最大的难点，也是当前误差的主要来源**（见第六节的实测对照）：
 
-身份特征也是可插拔的（[`embedders.py`](./src/embedders.py) 的名字表），由画风路由挑：
+身份特征也是可插拔的（[`embedders.py`](./backend/core/embedders.py) 的名字表），由画风路由挑：
 
 | 名称 | 模型 | 差异定义 | 同人阈值量级 |
 |---|---|---|---|
@@ -301,16 +302,16 @@ blur_var × confidence × (1 - frontal_weight + frontal_weight × frontal)
 - `crops_per_track > 1` 时一条轨迹有多张代表图，轨迹间的差异取 K×K 子块的**中位数**（不是最小值——最小值只要有一张脸偶然像另一个角色就会把两条轨迹粘起来，而 complete-linkage 的簇内约束会让这个错误继续扩散）。**默认 1**，多图版实测没有收益，见第六之三节。
 - 读中文路径的裁剪图必须走 `imread_unicode`（`cv2.imdecode` + `numpy.fromfile`）——`cv2.imread` 在 Windows 上遇中文目录名**静默返回 None**，和 `cv2.imwrite` 是同一个坑。
 
-### 阶段 6：选段 — `select_segments`（[main.py](./src/main.py)）
+### 阶段 6：选段 — `select_segments`（[main.py](./backend/core/main.py)）
 
 统计窗口内**出现过的不同角色数**（"出现过" = 轨迹时间区间与窗口相交，包括窗口开始前就在画面中的角色）。
 
 - 轨迹按 `start_time` 排序，候选窗口起点 `t = k × 0.3（抽帧间隔）` 步进。
-- 对窗口 `[t, t+window)`，用 `bisect` 取所有 `start_time < t+window` 的前缀，再过滤 `end_time ≥ t`，得到与窗口相交的轨迹（`_characters_in_window`，[main.py](./src/main.py)）。
-- 窗内角色数 `≥ min_events_per_window` → 窗口合格，输出片段，记录 `character_count`、`character_ids` 与 `track_ids`；随后**跳到 ≥ 片段终点**保证片段不重叠（[main.py](./src/main.py)）；否则 `k += 1` 继续滑动。
-- **窗内角色数怎么数由 `cluster_scope` 决定**（`_window_characters`，[main.py](./src/main.py)）：默认 `"window"` 时只拿这些相交轨迹重跑一次聚类（`IdentityIndex.count()`，取全片差异矩阵的子块，不重新提特征）；`"video"` 时数全片聚类留下的不同 `character_id`（`None` 不计）。片段里的 `character_ids` 始终是全片口径的 id，只作溯源，窗口口径下它可以比 `character_count` 长。理由与实测见第六之六节。
+- 对窗口 `[t, t+window)`，用 `bisect` 取所有 `start_time < t+window` 的前缀，再过滤 `end_time ≥ t`，得到与窗口相交的轨迹（`_characters_in_window`，[main.py](./backend/core/main.py)）。
+- 窗内角色数 `≥ min_events_per_window` → 窗口合格，输出片段，记录 `character_count`、`character_ids` 与 `track_ids`；随后**跳到 ≥ 片段终点**保证片段不重叠（[main.py](./backend/core/main.py)）；否则 `k += 1` 继续滑动。
+- **窗内角色数怎么数由 `cluster_scope` 决定**（`_window_characters`，[main.py](./backend/core/main.py)）：默认 `"window"` 时只拿这些相交轨迹重跑一次聚类（`IdentityIndex.count()`，取全片差异矩阵的子块，不重新提特征）；`"video"` 时数全片聚类留下的不同 `character_id`（`None` 不计）。片段里的 `character_ids` 始终是全片口径的 id，只作溯源，窗口口径下它可以比 `character_count` 长。理由与实测见第六之六节。
 
-**边界吸附**（`_nearest_cut`，[main.py](./src/main.py)）：候选起点只是任意的 `k × 0.3s`，大概率切在镜头中间。合格窗口拿到后，起点会吸附到 `clip_snap_max_shift`（2.0s）以内最近的切镜点——实测平均镜头长 2.8~3.7s，默认值意味着绝大多数片段都会被吸附。
+**边界吸附**（`_nearest_cut`，[main.py](./backend/core/main.py)）：候选起点只是任意的 `k × 0.3s`，大概率切在镜头中间。合格窗口拿到后，起点会吸附到 `clip_snap_max_shift`（2.0s）以内最近的切镜点——实测平均镜头长 2.8~3.7s，默认值意味着绝大多数片段都会被吸附。
 
 - 吸附后**必须在新位置重新统计角色数**（复用同一个 `_window_characters`），仍达标才采用，否则保持原起点。这不是可选的：`windows.json` 会记录每个片段的 `character_count` 和 `character_ids`，不重算就会写出与实际片段不符的数字。
 - 吸附点会让窗口越过视频末尾时同样放弃。
@@ -319,27 +320,34 @@ blur_var × confidence × (1 - frontal_weight + frontal_weight × frontal)
 
 产出 `segments` 列表 + `num_qualified` 计数 → 写入 `windows.json`。
 
+**实现上分成两步：先扫表，再重放**（`scan_windows` + [`segments.select_from_scan`](./backend/core/segments.py)）：
+
+- `scan_windows` 把**每个候选窗口起点的角色数**扫成一张表落进 `windows_scan.json`。这个量与 X 无关——X 只在"够不够"这一步做比较。
+- `select_from_scan` 在这张表上重放上面那套贪心（命中 → 吸附 → 复核 → 跳到片段终点）。它不 import cv2/onnxruntime，Web 后端直接引用同一份实现，所以改 X 不会和流水线走偏。
+- 表里除按 `frame_interval` 步进的网格点外，还单独记了**每个切镜点**的角色数（`cut_windows`）：吸附目标不落在网格上，没有这份数据就复核不了吸附后的窗口。
+- 收益：改 X 不用重跑检测和聚类，一次纯 Python 比较几十毫秒返回，滑块才拖得动；否则改一个数字要等几分钟。代价是扫表要把落在已选片段内部的窗口也算一遍（贪心本来会跳过），`IdentityIndex` 按行号缓存之后无可测开销。
+
 **注意**：`window_seconds` 已固定为 30（需求口径就是 30 秒窗口，不再当可调参数），`min_events_per_window` 默认 4（9 段素材真值落在 4~11，取下界）。30 秒素材因此每段最多产出 1 个片段。
 
-### 阶段 7：截取 — `clip_segments`（[main.py](./src/main.py)）
+### 阶段 7：截取 — `clip_segments`（[main.py](./backend/core/main.py)）
 
 对每个片段用 ffmpeg 从**原视频**重新编码切 `window_seconds` 秒：
 
 - `-ss start -t window -c:v h264_nvenc -c:a aac`，帧精确。
 - `start` 已在阶段 6 吸附到镜头边界，所以切出来的片段以一个完整镜头开头，而不是从某个镜头的中间起。
-- 优先 GPU 编码器 `h264_nvenc`，失败自动回退 CPU `libx264`（[main.py](./src/main.py)）。本机 `h264_nvenc` 实测可用。
+- 优先 GPU 编码器 `h264_nvenc`，失败自动回退 CPU `libx264`（[main.py](./backend/core/main.py)）。本机 `h264_nvenc` 实测可用。
 
 ---
 
-## 六、阈值敏感性扫描 — [`src/sweep.py`](./src/sweep.py)
+## 六、阈值敏感性扫描 — [`backend/core/sweep.py`](./backend/core/sweep.py)
 
 本流水线的两个关键参数会**互相补偿**：`identity_threshold` 调严 → 同一角色被拆成多个身份 → 角色数虚高 → 更容易越过 `min_events_per_window` 门槛。两个参数一起动时，最终片段数可以在几倍范围内摆动，而这与"画面里到底有几个角色"没有必然关系。
 
 `sweep.py` 在 `identity_threshold × min_events_per_window` 的网格上重跑聚类与选段，把这个波动量化出来：
 
 ```powershell
-& $py src/sweep.py data/*.mp4
-& $py src/sweep.py <video> --threshold 0.05,0.1,0.178 --min-events 3,5,8
+& $py backend/core/sweep.py data/*.mp4
+& $py backend/core/sweep.py <video> --threshold 0.05,0.1,0.178 --min-events 3,5,8
 ```
 
 视频只解码一次、身份特征只提取一次，网格上每个格子只是重跑一次层次聚类和滑窗计数，几乎免费——所以格子多不影响耗时。产出控制台表格 + `output/sweep.csv`。`sweep.py` 同样走画风路由，所以不同画风的素材在同一张表里用的是各自的模型，**阈值那一列跨画风不可比**。
@@ -383,16 +391,16 @@ blur_var × confidence × (1 - frontal_weight + frontal_weight × frontal)
 
 ---
 
-## 六之二、召回率评估 — [`src/evaluate.py`](./src/evaluate.py)
+## 六之二、召回率评估 — [`backend/core/evaluate.py`](./backend/core/evaluate.py)
 
 上一节说明了"没有通用阈值"，这一节是把它变成一个可复现的验收数字。
 
 ```powershell
-& $py src/evaluate.py data/*.mp4                                    # 出厂配置（含画风路由）
-& $py src/evaluate.py data/*.mp4 --threshold 0.12,0.178,0.2,0.85,0.95   # 阈值网格
-& $py src/evaluate.py data/*.mp4 --eyes 2                           # 打开正脸过滤做对照
+& $py backend/core/evaluate.py data/*.mp4                                    # 出厂配置（含画风路由）
+& $py backend/core/evaluate.py data/*.mp4 --threshold 0.12,0.178,0.2,0.85,0.95   # 阈值网格
+& $py backend/core/evaluate.py data/*.mp4 --eyes 2                           # 打开正脸过滤做对照
 # 关掉路由做受控对照：把同一套模型/门槛压到全部素材上，再看分风格那几列
-& $py src/evaluate.py data/*.mp4 --no-style-routing --detector real_face_scrfd --embedder arcface --min-face-height 0.09
+& $py backend/core/evaluate.py data/*.mp4 --no-style-routing --detector real_face_scrfd --embedder arcface --min-face-height 0.09
 ```
 
 产出控制台表格 + `<output-dir>/recall.csv`。与 `sweep.py` 一样，视频只解码一次、身份特征只提一次，网格加格子几乎免费。
@@ -411,7 +419,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 **阈值跨 embedder 不可比**：2D 走 CCIP（同人差异 ≈0.1~0.2），非 2D 走 ArcFace（≈0.6~1.0）。开着路由扫网格时，汇总表里的全局 macro 那几列没有意义，只有分风格那几列可读。
 
-### 出厂配置下的逐视频召回（2026-08-18，`& $py src/evaluate.py data/*.mp4`）
+### 出厂配置下的逐视频召回（2026-08-18，`& $py backend/core/evaluate.py data/*.mp4`）
 
 | 素材 | 风格真值 | 路由判定 | 检测 + 特征 | 阈值 | 真值角色 | 检出角色 | 召回 | ratio | F1 |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|
@@ -604,7 +612,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 | 魔女之旅 | 2d | 1420s | 788 | 54 | 34 | 47 | 7 / 19 |
 | **合计** | | **7.3 小时** | **15525** | **1155** | **676** | **884** | |
 
-（这张表由 `src/summarize.py output_raw` 直接生成。）
+（这张表由 `backend/core/summarize.py output_raw` 直接生成。）
 
 **没有出现崩溃、内存问题或超时**：17 段共 7.3 小时素材一趟跑完。吞吐：2D 支路 **约 4 倍于实时**（24 分钟 1080p 片 ≈ 363 秒），真人/CG 支路 **约 8 倍**（31 分钟 720p 片 ≈ 236 秒）；两者都含一趟全帧率 scdet + 一趟 0.3 秒抽帧。流式内存约束在片长上依然成立。
 
@@ -616,7 +624,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 ### 问题二：同一个角色被拆成多个身份，且拆分边界是画质而不是身份
 
-`魔女之旅` 整集 54 个角色，接触印相表（`src/montage.py`）一看就知道虚高：白发主角一个人占了 #6 / #9 / #11 / #12 / #13 五个簇，棕发女占 #30 / #31 / #45，眼镜女占 #34 / #43。而且**每个簇内部高度一致**——#11 一整行是侧脸、#12 和 #45 一整行是暗 / 糊图。CCIP 特征里"画质与姿态"这条轴压过了"身份"这条轴。
+`魔女之旅` 整集 54 个角色，接触印相表（`backend/core/montage.py`）一看就知道虚高：白发主角一个人占了 #6 / #9 / #11 / #12 / #13 五个簇，棕发女占 #30 / #31 / #45，眼镜女占 #34 / #43。而且**每个簇内部高度一致**——#11 一整行是侧脸、#12 和 #45 一整行是暗 / 糊图。CCIP 特征里"画质与姿态"这条轴压过了"身份"这条轴。
 
 真人支路上同一个现象更露骨。`爱情神话`（31 分钟正片，1357 条轨迹 → **146 个角色**，55/62 个窗口合格）的印相表里：戴眼镜的男主角占了 **#0（正脸，n=247）/ #8（侧脸，n=31）/ #3（暗且糊，n=15）/ #25（混合，n=21）** 四个簇，粉发女主占 #1 / #2 / #9 三个簇。**同一个人按"正脸 / 侧脸 / 糊 / 暗"被整齐地分了四堆**——这不是身份聚类失败的随机噪声，是特征空间里画质与姿态这条轴压过了身份轴。
 
@@ -721,7 +729,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 5. **在场景/镜头邻域内先合并再跨场景合并**：同一场戏内光照一致，先消掉光照这条轴，可能比全局一次聚类更稳。
    → **已按更粗的粒度试过并落地**：把聚类范围直接压回单个 30 秒窗口，macro F1 0.79 → 0.90，见第六之六节。
 
-## 六之六、聚类范围改为单个 30 秒窗口 — [`src/evaluate_long.py`](./src/evaluate_long.py)
+## 六之六、聚类范围改为单个 30 秒窗口 — [`backend/core/evaluate_long.py`](./backend/core/evaluate_long.py)
 
 第六之五节留了两个死结：**过拆随片长恶化**（`魔女之旅` 整集 54 个角色、主角一人占 5 簇），以及**没有片长尺度的真值可以验证任何修法**。这一节两个都拆掉了。
 
@@ -860,7 +868,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 也就是说，**这条警告精确地只在它该响的那一次响了**。缺陷没有被消除（它消除不了），但它从"静默地整片用错一档参数"变成了"跑的时候当场告诉你，并给出一行命令解决"：
 
 ```powershell
-& $py src/main.py "data/原始数据/爱情神话.mp4" --style real --no-clip
+& $py backend/core/main.py "data/原始数据/爱情神话.mp4" --style real --no-clip
 ```
 
 
@@ -934,7 +942,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 - **X=4 输出近一半的片长**，这不是缺陷，是这个取值本身的含义——窗内角色数的中位数就是 3，4 只比中位数高一点。
 - 想要"少而显眼"的片段，**X 落在 6~8 是有意义的区间**（25% → 12%）；X≥10 在多数片源上直接归零。
 - **各片源差异极大**，不该指望一个 X 通吃：`擅长捉弄的高木同学`（双人剧）X=3 就砍到 40%，而 `魔女之旅` 要到 X=9 才砍到同一水平。这也是第六之五节说"门槛没在筛选、只在反映素材的角色密度"的量化版本。
-- 这张表由 `src/sweep.py`（单片，`ME=` 各列）和本节的扫描脚本产出；换素材要重扫，不要照抄这里的百分比。
+- 这张表由 `backend/core/sweep.py`（单片，`ME=` 各列）和本节的扫描脚本产出；换素材要重扫，不要照抄这里的百分比。
 
 **这一条不再列为"待解决问题"，而是"待需求方给数"**：流水线该做的（把每个窗口的角色数数准）已经在第六之六节做到 macro F1 0.90，剩下的是取哪条线的问题。
 
@@ -953,11 +961,11 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 4. **在没有逐窗口人工真值的情况下，单次运行的数字不是测量**。现在 `data/` 下的 9 段素材带文件名真值，所以"角色数 vs 真值"这件事第一次变得可测——但真值本身也带标注噪声（模棱两可的脸很多）。**这套流水线适合用来找候选片段供人工筛选**，不适合用来断言"这段视频里有 N 个角色"或"本片不存在满足条件的片段"——后者尤其做不到：检测、身份去重、计数任一环节漏一次就会放过真实片段，系统只能给出"未发现"，无法证明"不存在"。
 
-5. **GPU 依赖**：检测走 ONNX（本机 onnxruntime 1.18.1 暴露 TensorRT / CUDA / CPU provider），编码默认 `h264_nvenc`。无 GPU 时编码自动回退 `libx264`，检测则取决于 onnxruntime 安装的 provider（`_report_providers` 会打印一次，见 [main.py](./src/main.py)）。
+5. **GPU 依赖**：检测走 ONNX（本机 onnxruntime 1.18.1 暴露 TensorRT / CUDA / CPU provider），编码默认 `h264_nvenc`。无 GPU 时编码自动回退 `libx264`，检测则取决于 onnxruntime 安装的 provider（`_report_providers` 会打印一次，见 [main.py](./backend/core/main.py)）。
 
-6. **Windows 中文路径**：`cv2.imwrite` 遇到中文目录名会静默失败（返回 `False`，不抛异常），写图一律走 `imwrite_unicode`。控制台输出走 `force_utf8_stdout`（[main.py](./src/main.py)），否则中文片名在 UTF-8 终端下是乱码。`cv2.VideoCapture` 本身对中文路径正常。
+6. **Windows 中文路径**：`cv2.imwrite` 遇到中文目录名会静默失败（返回 `False`，不抛异常），写图一律走 `imwrite_unicode`。控制台输出走 `force_utf8_stdout`（[main.py](./backend/core/main.py)），否则中文片名在 UTF-8 终端下是乱码。`cv2.VideoCapture` 本身对中文路径正常。
 
-7. **可扩展性**：检测器和身份特征各有一张 `@register` 名字表（[detectors.py](./src/detectors.py) / [embedders.py](./src/embedders.py)），下游跟踪/选段/截取只消费 `Detection` 对象和一个 N×N 差异矩阵。**画风路由就落在这两个插拔点上**——`StyleProfile` 里存的就是这两张表的键。加一种画风 = 加一个 profile；加一种目标（动物、物体）= 加一个 `Detector` 子类。新增检测器的 `detect()` 收到的是 `PIL.Image.Image`（不是路径），要自定义裁剪口径就覆盖 `make_crop()`。检测器实例按名字在进程内缓存，同画风的多个视频不会重复加载模型。
+7. **可扩展性**：检测器和身份特征各有一张 `@register` 名字表（[detectors.py](./backend/core/detectors.py) / [embedders.py](./backend/core/embedders.py)），下游跟踪/选段/截取只消费 `Detection` 对象和一个 N×N 差异矩阵。**画风路由就落在这两个插拔点上**——`StyleProfile` 里存的就是这两张表的键。加一种画风 = 加一个 profile；加一种目标（动物、物体）= 加一个 `Detector` 子类。新增检测器的 `detect()` 收到的是 `PIL.Image.Image`（不是路径），要自定义裁剪口径就覆盖 `make_crop()`。检测器实例按名字在进程内缓存，同画风的多个视频不会重复加载模型。
 
 8. **切镜检测为什么不用直方图**：旧实现在 0.3s 抽帧上比较相邻两帧的 HSV（H、S）直方图相关性。在 `data/` 下 9 个片段上以 scdet 为参照实测（其中魔女之旅、EVA_1730、凡人修仙传_695s 三段已逐帧人工验证过对照图）：
 
@@ -983,7 +991,7 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 
 ---
 
-## 八、参数速查表（`src/config.py`）
+## 八、参数速查表（`backend/core/config.py`）
 
 | 参数 | 默认值 | 作用 | CLI 覆盖 |
 |------|--------|------|----------|
@@ -1065,3 +1073,80 @@ recall = min(检出角色数, 真值角色数) / 真值角色数
 5. **真值本身有噪声**：标注时存在大量模棱两可的脸，且"首尾不完整的镜头算不算"这类口径问题没有统一。上面所有小数点后两位的数字，都应按数量级读。
 
 6. **存在性判断只能给"未发现"**：检测、身份去重、计数任一环节漏一次就会放过真实片段，系统无法证明"不存在"。
+
+---
+
+## 十、Web 界面 — `backend/` + `frontend/`
+
+本机跑的一个界面：**上传视频 → 分析 → 结果页拖 X 实时看片段 → 打包下载**。流水线本身一行没改（除了上面那张扫描表和两个可选钩子）。
+
+### 跑起来
+
+```powershell
+# 后端（平铺导入，所以必须 --app-dir backend；别开 --reload，进程池会跟着重启）
+& $py -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000
+# 前端
+cd frontend; pnpm dev      # http://127.0.0.1:3000
+```
+
+凭据全部从项目根 `.env` 读（`MYSQL_*` / `STORAGE_ROOT` / `APP_ACCESS_CODE` / `PYTHON_BIN` / `GPU_COUNT`），缺一个直接 `RuntimeError` 退出，不写默认值兜底。
+
+### 已定的决策（附理由，不要推翻）
+
+| 决策 | 理由 |
+|---|---|
+| **运行前零参数**，唯一可调的是 X，且只出现在结果页 | 用户对 X 取值没有直觉，事前猜不如事后调；其余参数（`identity_threshold`、`min_face_height_ratio`）跨画风不可比（第六之一节），暴露出去必出事 |
+| **不做用户系统**，只有一个共享访问码 | 公网上传 + GPU + 下载，无门槛等于开放转码服务器。一个 env 变量 + 一个依赖项，约 20 行（`backend/security.py`） |
+| **鉴权是 HttpOnly cookie，不是请求头** | `<video src>` / `<img src>` / 下载链接都是浏览器直接发的，带不了自定义头 |
+| **不用 Redis** | 本机 1 张显卡 → 并行度 1；Web 是单个 uvicorn 进程 → 进度用 `multiprocessing.Manager().dict()` 就够。Redis 留给上公网那一步 |
+| **MySQL 只存任务元数据**，二进制全在文件系统 | 大文件进数据库要整个读进内存，且没法 HTTP Range 断点续传 |
+| **上传与分析是两个阶段**，视频必须完整落盘才能开跑 | `cv2.VideoCapture` / `ffmpeg scdet` / `ffmpeg -ss` 都要一个能随机定位的文件路径，吃不了字节流。第四节说的「流式不落盘」指的是**解码出来的帧**不落盘，不是视频文件 |
+| **假定上传全是 H.264 / MP4** | 上传完 `ffprobe` 探一次，不是就 fail fast 报错，不做转码。以后要支持 HEVC / mkv，在这个探测点加分支 |
+| **Web 进程不 import `backend/core/main.py`** | 那会把 cv2 / onnxruntime / imgutils 拖进来几百 MB 常驻。只 import `config.py` 和 `segments.py`，`backend/pipeline.py` 是这道边界；重依赖只在 worker 子进程里 |
+| **前端不引 Tailwind** | 设计稿的值都很碎（`12.5px`、`letter-spacing: 0.16em`、`rgb(232 163 61 / 0.13)`），进 Tailwind 全得写成方括号任意值，绕一圈回原地还多一层构建。用 `frontend/app/assets/css/tokens.css` + SFC 里的 `<style scoped>`，设计源是 `design/*.dc.html`（git 忽略，不要改） |
+
+### 存储布局与数据表
+
+```
+storage/
+  assets/{asset_id}/source.mp4        上传的原视频
+                   /poster.jpg        ffprobe 抽的封面
+                   /meta.json         时长 / 分辨率 / 编码 / 体积
+  tasks/{task_id}/{video_stem}/       直接用 run_pipeline 的输出目录
+                   windows.json  windows_scan.json  tracks.json  crops/
+                   clips/             按需生成，可随时删
+```
+
+```
+assets      id, filename, path, duration, width, height, codec, size_bytes, created_at
+tasks       id, status, created_at, started_at, finished_at, error
+task_items  id, task_id, asset_id, status, style, num_tracks, num_characters, out_dir, error
+```
+
+### 接口一览
+
+| 操作 | 接口 |
+|---|---|
+| 校验访问码 / 查会话 | `POST /api/auth/verify`、`GET /api/auth/session` |
+| 分片上传 | `POST /api/uploads/init` → `POST /api/uploads/{id}/chunk` ×N → `POST /api/uploads/{id}/complete` |
+| 素材库 | `GET /api/assets`、`DELETE /api/assets/{id}` |
+| 封面 / 任意帧 | `GET /api/assets/{id}/poster`、`GET /api/assets/{id}/frame` |
+| 播原视频（预览用，支持 Range） | `GET /api/assets/{id}/stream` |
+| 建任务 / 列表 / 详情 | `POST /api/tasks`、`GET /api/tasks`、`GET /api/tasks/{id}` |
+| 进度（SSE） / 取消 | `GET /api/tasks/{id}/events`、`POST /api/tasks/{id}/cancel` |
+| **拖 X 重算** | `GET /api/tasks/{id}/segments?x=6` |
+| 代表人脸 | `GET /api/tasks/{id}/{stem}/crops/{character_id}` |
+| 下载单个片段（现场编码） | `GET /api/tasks/{id}/clip?stem=..&start=..` |
+| 打包下载 | `GET /api/tasks/{id}/download?x=6`（`StreamingResponse` 边压边发，压缩级别 0） |
+
+除 `/api/auth/*` 外全部挂 `require_access` 依赖。
+
+### 几条与流水线有关的约定
+
+- **分析等价 `--no-clip`**：X 还没定，编出来的一大半会被拖走。只有点「下载」时才现场编码（`backend/media.py`）。
+- **预览不编码**：`<video>` + HTTP Range 播原视频，`currentTime` 跳到片段起点。零编码零额外磁盘。
+- **拖 X 走 `windows_scan.json` + `select_from_scan`**（第五节阶段 6），不重跑模型。
+- **输出目录名用原始（中文）文件名**：素材统一存成 `assets/{id}/source.mp4`，stem 全是 `source` 会互相覆盖，所以 `process_video` 加了个 `out_name` 参数。中文一路带到 zip 条目名（`zipfile` 自动打 UTF-8 标志位）。
+- **进度**：`process_video` 的 `on_progress(stage, fraction)` 钩子 → `multiprocessing.Manager` 字典 → SSE。回调抛异常即中断扫描，取消任务就是这么实现的。
+- **并行度 = 显卡数**：同一张卡上多进程跑多个视频实测没有收益（第六之八节）。
+- **不建片段表**——片段随 X 变化，是算出来的，不是存下来的。

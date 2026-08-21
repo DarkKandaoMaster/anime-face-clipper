@@ -16,8 +16,8 @@
 
 从项目根目录运行：
 
-    python src/main.py <video>              # 处理单个视频 -> output/<stem>/
-    python src/main.py <video> --viz 8      # 同时导出带标注的示例帧
+    python backend/core/main.py <video>              # 处理单个视频 -> output/<stem>/
+    python backend/core/main.py <video> --viz 8      # 同时导出带标注的示例帧
 
 阶段（按下方分节注释组织）：
     解码抽帧 -> 检测 -> 过滤 -> 跟踪 -> 角色识别 -> 选段 -> 截取
@@ -39,7 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -57,9 +57,12 @@ from detectors import (
     get_detector,
 )
 from embedders import get_embedder
+# 切镜吸附与选段重放都住在 segments.py（后端要在不 import cv2 的前提下用同一份逻辑）。
+# _nearest_cut 这个名字保留为再导出：它是本模块的历史接口。
+from segments import nearest_cut as _nearest_cut, select_from_scan
 from style import apply_style, classify_style
 
-# 重新导出，方便调用方使用 from src.main import Detection。
+# 重新导出，方便调用方使用 from main import Detection。
 # 该类定义在 detectors.py 中，以避免检测器模块出现循环依赖。
 __all__ = [
     "Detection", "Track", "IdentityIndex", "crop_bbox", "expand_bbox",
@@ -750,14 +753,59 @@ def _window_characters(
     return character_ids, overlapping, count
 
 
-def _nearest_cut(t: float, cuts: List[float], max_shift: float) -> Optional[float]:
-    """距 t 最近的切镜时刻；没有或超出 max_shift 时返回 None（max_shift=0 即关闭）。"""
-    if not cuts or max_shift <= 0:
-        return None
-    i = bisect.bisect_left(cuts, t)
-    candidates = cuts[max(0, i - 1):i + 1]
-    best = min(candidates, key=lambda c: abs(c - t))
-    return best if abs(best - t) <= max_shift else None
+def scan_windows(
+    tracks: List[Track],
+    duration: float,
+    config: Config,
+    cuts: Optional[List[float]] = None,
+    identity: Optional[IdentityIndex] = None,
+) -> Dict:
+    """把每个候选窗口起点的角色数扫成一张表（windows_scan.json 的内容）。
+
+    这张表与 X（min_events_per_window）无关——X 只在选段那一步做比较。落下它，
+    改 X 就不用重跑检测和聚类，Web 端拖滑块才拖得动（见 segments.py）。
+
+    除按 frame_interval 步进的网格点外，还要单独记下**每个切镜时刻**的角色数：
+    合格窗口的起点会吸附到最近的切镜点，而切镜点不落在网格上，重放选段时
+    没有这份数据就复核不了吸附后的窗口。
+
+    返回的 windows 下标 k 对应起点 t = k × frame_interval，与 select_from_scan
+    的假设一致。
+    """
+    ordered = sorted(tracks, key=lambda tr: tr.start_time)
+    starts = [tr.start_time for tr in ordered]
+    window = config.window_seconds
+    step = config.frame_interval
+
+    windows: List[Dict] = []
+    k = 0
+    while True:
+        t = k * step
+        if t + window > duration + 1e-6:
+            break
+        _ids, _overlapping, count = _window_characters(
+            ordered, starts, t, window, config, identity
+        )
+        windows.append({"t": round(t, 3), "n": count})
+        k += 1
+
+    cut_windows: List[Dict] = []
+    for cut in cuts or []:
+        if cut + window > duration + 1e-6:
+            continue
+        _ids, _overlapping, count = _window_characters(
+            ordered, starts, cut, window, config, identity
+        )
+        cut_windows.append({"t": round(cut, 3), "n": count})
+
+    return {
+        "duration": round(duration, 3),
+        "frame_interval": step,
+        "window_seconds": window,
+        "cuts": [round(c, 3) for c in (cuts or [])],
+        "windows": windows,
+        "cut_windows": cut_windows,
+    }
 
 
 def select_segments(
@@ -766,6 +814,7 @@ def select_segments(
     config: Config,
     cuts: Optional[List[float]] = None,
     identity: Optional[IdentityIndex] = None,
+    scan: Optional[Dict] = None,
 ) -> Tuple[List[Dict], int]:
     """滑动窗口统计出现过的不同角色数，并贪心选择片段。
 
@@ -786,49 +835,37 @@ def select_segments(
     k×frame_interval，大概率切在镜头中间。吸附后在新位置重新统计角色数，
     仍达标才采用，否则保持原起点。
 
+    实现上分成两步：先把每个窗口起点的角色数扫成一张表（:func:`scan_windows`），
+    再在表上重放贪心选段（:func:`segments.select_from_scan`）。这样 Web 端改 X
+    时走的是**同一份**选段实现，不会与流水线走偏。已经扫过的表可以用 scan
+    参数传进来，避免 process_video 里扫两遍。
+
     返回：
         元组 (segments, num_qualified_windows)，其中每个片段都是包含
         start、end、character_count、character_ids 和 track_ids 的字典。
     """
+    if scan is None:
+        scan = scan_windows(tracks, duration, config, cuts, identity)
+    picks, num_qualified = select_from_scan(
+        scan, config.min_events_per_window, config.clip_snap_max_shift
+    )
+
     ordered = sorted(tracks, key=lambda tr: tr.start_time)
     starts = [tr.start_time for tr in ordered]
-    window = config.window_seconds
-    step = config.frame_interval
-
     segments: List[Dict] = []
-    num_qualified = 0
-    k = 0
-    while True:
-        t = k * step
-        if t + window > duration + 1e-6:
-            break
-        character_ids, overlapping, count = _window_characters(
-            ordered, starts, t, window, config, identity
+    for pick in picks:
+        character_ids, overlapping = _characters_in_window(
+            ordered, starts, pick["start"], config.window_seconds
         )
-        if count >= config.min_events_per_window:
-            num_qualified += 1
-            start = t
-            snapped = _nearest_cut(t, cuts or [], config.clip_snap_max_shift)
-            if snapped is not None and snapped + window <= duration + 1e-6:
-                snapped_ids, snapped_overlapping, snapped_count = _window_characters(
-                    ordered, starts, snapped, window, config, identity
-                )
-                if snapped_count >= config.min_events_per_window:
-                    start = snapped
-                    character_ids, overlapping = snapped_ids, snapped_overlapping
-                    count = snapped_count
-            segments.append(
-                {
-                    "start": round(start, 3),
-                    "end": round(start + window, 3),
-                    "character_count": count,
-                    "character_ids": character_ids,
-                    "track_ids": [tr.track_id for tr in overlapping],
-                }
-            )
-            k = math.ceil((start + window) / step - 1e-9) # math.ceil((start + window) / step)取最小的满足条件的整数，后面的 - 1e-9 是为了浮点防抖，防浮点误差
-        else:
-            k += 1
+        segments.append(
+            {
+                "start": pick["start"],
+                "end": pick["end"],
+                "character_count": pick["character_count"],
+                "character_ids": character_ids,
+                "track_ids": [tr.track_id for tr in overlapping],
+            }
+        )
     return segments, num_qualified
 
 
@@ -1033,6 +1070,7 @@ def scan_video(
     limit_seconds: Optional[float] = None,
     viz_count: int = 0,
     cuts: Optional[List[float]] = None,
+    on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Tuple[List[Track], List[Dict], float, int, List[float]]:
     """流式扫描一遍视频，产出轨迹和落盘的代表裁剪图。
 
@@ -1050,6 +1088,8 @@ def scan_video(
         viz_count: 随机导出的标注示例帧数量。
         cuts: 预先算好的切镜时刻表。None 时就地跑一趟 scdet；批量处理时由
             run_pipeline 提前在后台线程里算好传进来（见 iter_cut_tables）。
+        on_progress: 可选的进度回调 ``(stage, fraction)``，Web 端用它驱动进度条。
+            回调抛异常会直接中断扫描——取消任务正是靠这个（见 backend/worker.py）。
 
     切镜表由 detect_cuts 单独跑一趟全帧率解码得到（scdet 需要看到每一帧，
     0.3s 抽帧下镜头内的正常演进已与真切镜混叠）。
@@ -1064,6 +1104,8 @@ def scan_video(
 
     if cuts is None:
         print(f"[{stem}] scdet scan (threshold={config.scdet_threshold})...")
+        if on_progress:
+            on_progress("cuts", 0.0)
         cuts = detect_cuts(config, video_path, limit_seconds)
     print(f"[{stem}] {len(cuts)} cuts detected")
 
@@ -1092,6 +1134,10 @@ def scan_video(
     for index, time, image, image_pil in prefetch(decoded(), config.prefetch_frames):
         num_frames += 1
         frame_h = image.shape[0]
+        # 每 20 个采样帧报一次进度（≈6 秒素材时间），够进度条走得平滑，
+        # 又不会把跨进程的 Manager 字典写成瓶颈。
+        if on_progress is not None and num_frames % 20 == 0 and duration > 0:
+            on_progress("scan", min(1.0, time / duration))
 
         # 上一采样帧与本帧之间夹着切镜时刻则断轨。首帧无前帧，固定为 False。
         cut = prev_time is not None and _cut_between(
@@ -1167,6 +1213,8 @@ def process_video(
     viz_count: int = 0,
     clip: bool = True,
     cuts: Optional[List[float]] = None,
+    out_name: Optional[str] = None,
+    on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> Dict:
     """对单个视频运行完整流程。
 
@@ -1178,12 +1226,16 @@ def process_video(
         viz_count: 随机导出的标注示例帧数量。
         clip: 是否真的把选中的片段编码出来。False 时只写 JSON——在长片上
             做批量测量时，编码几十个 30 秒片段的耗时会盖过流水线本身。
+        out_name: 输出子目录名，默认取视频文件名 stem。Web 端的素材统一存成
+            ``assets/{id}/source.mp4``，stem 全是 "source" 会互相覆盖，所以要
+            用原始文件名另起一个目录名（中文原样保留，见 CLAUDE.md 的中文路径坑）。
+        on_progress: 可选的进度回调 ``(stage, fraction)``，见 :func:`scan_video`。
 
     返回：
         摘要字典（也会持久化到 JSON 文件中）。
     """
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    out_dir = os.path.join(output_root, stem)
+    out_dir = os.path.join(output_root, out_name or stem)
     os.makedirs(out_dir, exist_ok=True)
 
     # 画风路由：先判 2D / 非 2D，再据此换上整套识别参数。必须在扫描之前做，
@@ -1208,17 +1260,28 @@ def process_video(
     _report_providers(detector)
 
     tracks, detection_records, duration, num_frames, cuts = scan_video(
-        config, video_path, out_dir, detector, limit_seconds, viz_count, cuts
+        config, video_path, out_dir, detector, limit_seconds, viz_count, cuts, on_progress
     )
 
     # 角色识别：CCIP 聚类给轨迹分配 character_id。
     print(f"[{stem}] identifying characters...")
+    if on_progress:
+        on_progress("cluster", 0.0)
     num_characters, identity = assign_characters(tracks, out_dir, config)
     print(f"[{stem}] {num_characters} distinct characters identified "
           f"(cluster_scope={config.cluster_scope})")
 
-    # 片段选择。
-    segments, num_qualified = select_segments(tracks, duration, config, cuts, identity)
+    # 窗口扫描表：每个候选窗口起点的角色数，与 X 无关。
+    # 落盘是为了让 Web 端改 X 时不必重跑检测和聚类（见 segments.select_from_scan）。
+    if on_progress:
+        on_progress("select", 0.0)
+    scan = scan_windows(tracks, duration, config, cuts, identity)
+    _write_json(os.path.join(out_dir, "windows_scan.json"), scan)
+
+    # 片段选择（在同一张表上重放，保证与 Web 端口径一致）。
+    segments, num_qualified = select_segments(
+        tracks, duration, config, cuts, identity, scan=scan
+    )
     print(
         f"[{stem}] {num_qualified} qualified windows, {len(segments)} segments selected"
     )
@@ -1313,7 +1376,7 @@ def run_pipeline(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Anime face clipper.")
-    # 位置参数：输入视频，可传多个。例：python src/main.py a.mp4 b.mp4
+    # 位置参数：输入视频，可传多个。例：python backend/core/main.py a.mp4 b.mp4
     parser.add_argument("videos", nargs="+", help="Input video path(s).")
     # 输出根目录，默认 output。
     parser.add_argument("--output-dir", default="output", help="Output base directory.")

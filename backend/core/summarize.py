@@ -6,10 +6,10 @@
 
 怎么跑（项目根目录）：
 
-    $py src/main.py data/原始数据/*.mp4 --no-clip --output-dir output_raw
-    $py src/summarize.py output_raw
+    $py backend/core/main.py data/原始数据/*.mp4 --no-clip --output-dir output_raw
+    $py backend/core/summarize.py output_raw
 
-配合 `src/montage.py` 用：这里看数量对不对，那里看身份分对没分对。
+配合 `backend/core/montage.py` 用：这里看数量对不对，那里看身份分对没分对。
 """
 
 import argparse

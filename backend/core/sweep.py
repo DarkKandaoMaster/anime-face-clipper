@@ -13,9 +13,9 @@ min_events_per_window 的网格上反复重跑角色聚类与选段，打出一�
 
 怎么跑（Windows PowerShell，项目根目录下）：
     $py = "D:\\Programs\\DevEnvironments\\Anaconda\\anaconda3\\envs\\myenv\\python.exe"
-    & $py src/sweep.py data/*.mp4
-    & $py src/sweep.py <video> --limit-seconds 120
-    & $py src/sweep.py data/*.mp4 --threshold 0.05,0.1,0.178 --min-events 4,6,8
+    & $py backend/core/sweep.py data/*.mp4
+    & $py backend/core/sweep.py <video> --limit-seconds 120
+    & $py backend/core/sweep.py data/*.mp4 --threshold 0.05,0.1,0.178 --min-events 4,6,8
 
 每段素材实际用的那个阈值（画风路由定的）一定会出现在它自己那张表里，
 所以不同画风的素材行数可能不同——阈值那一列跨画风不可比。

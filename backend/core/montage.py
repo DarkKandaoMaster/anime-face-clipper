@@ -6,8 +6,8 @@
 
 怎么跑（项目根目录）：
 
-    $py src/montage.py output_raw/魔女之旅
-    $py src/montage.py output_raw/魔女之旅 --clusters 30 --per-cluster 10
+    $py backend/core/montage.py output_raw/魔女之旅
+    $py backend/core/montage.py output_raw/魔女之旅 --clusters 30 --per-cluster 10
 
 产出：<out_dir>/montage.jpg（每次重跑覆盖，幂等）。
 """

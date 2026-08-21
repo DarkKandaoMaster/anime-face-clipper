@@ -50,37 +50,39 @@ $py = "D:\Programs\DevEnvironments\Anaconda\anaconda3\envs\myenv\python.exe"   #
 ### 命令
 
 ```powershell
-& $py src/main.py "data/魔女之旅_760s（人脸数期望：2+5+1+0+3+1）（跨镜头身份去重后期望：9）.mp4" --min-events 5
-& $py src/main.py <video> --limit-seconds 60 --viz 8   # 调参：只跑前 60s + 导出 8 张标注帧
-& $py src/sweep.py <video>                             # 阈值敏感性网格扫描 → output/sweep.csv
-& $py src/evaluate.py data/*.mp4                       # 召回率评估（出厂配置）→ output/recall.csv
-& $py src/evaluate.py data/*.mp4 --threshold 0.178,0.2,0.85,0.95   # 阈值网格上扫召回
-& $py src/evaluate.py data/*.mp4 --eyes 2              # 打开正脸过滤做对照
+& $py backend/core/main.py "data/魔女之旅_760s（人脸数期望：2+5+1+0+3+1）（跨镜头身份去重后期望：9）.mp4" --min-events 5
+& $py backend/core/main.py <video> --limit-seconds 60 --viz 8   # 调参：只跑前 60s + 导出 8 张标注帧
+& $py backend/core/sweep.py <video>                             # 阈值敏感性网格扫描 → output/sweep.csv
+& $py backend/core/evaluate.py data/*.mp4                       # 召回率评估（出厂配置）→ output/recall.csv
+& $py backend/core/evaluate.py data/*.mp4 --threshold 0.178,0.2,0.85,0.95   # 阈值网格上扫召回
+& $py backend/core/evaluate.py data/*.mp4 --eyes 2              # 打开正脸过滤做对照
 # 受控对照：关掉路由，把同一套模型/门槛压到全部素材，再看分风格那几列
-& $py src/evaluate.py data/*.mp4 --no-style-routing --detector real_face_scrfd --embedder arcface --min-face-height 0.09
-& $py src/main.py <video> --no-clip                     # 只分析不编码片段（长片批量实测用）
-& $py src/main.py <video> --frontal-weight 1.0         # 正脸分给代表图擂台加权（默认 0=关）
-& $py src/evaluate.py data/*.mp4 --frontal-weight 1.0 --min-frontal 0.3   # 正脸的两种用法做对照
-& $py src/evaluate_long.py                             # 片长尺度对照：全片聚类 vs 窗口内聚类（真值 = 9 段切片在片源里的原位窗口）
-& $py src/evaluate_long.py --titles 魔女之旅 --no-clip-baseline   # 只跑一部
-& $py src/main.py <video> --cluster-scope window       # 聚类范围压回单个 30 秒窗口
-& $py src/main.py <video> --style real                 # 人工指定画风（3D CG / 真人机器分不开，见第五轮）
-& $py src/main.py <video> --prefetch 0                 # 关掉解码预取，退回完全串行（对照/内存受限时）
-& $py src/evaluate.py data/*.mp4 --min-character-seconds 0.9   # 按角色算的累计出镜时长门槛
-& $py src/montage.py output/<stem> --clusters 18       # 按 character_id 拼接触印相表，肉眼核对聚类
-& $py src/summarize.py output_raw                      # 汇总一批 windows.json：片段数 / 不重叠窗口上限
-& $py -m pytest tests -q                               # 141 个纯逻辑单测，3s，不需要 GPU/模型/网络
+& $py backend/core/evaluate.py data/*.mp4 --no-style-routing --detector real_face_scrfd --embedder arcface --min-face-height 0.09
+& $py backend/core/main.py <video> --no-clip                     # 只分析不编码片段（长片批量实测用）
+& $py backend/core/main.py <video> --frontal-weight 1.0         # 正脸分给代表图擂台加权（默认 0=关）
+& $py backend/core/evaluate.py data/*.mp4 --frontal-weight 1.0 --min-frontal 0.3   # 正脸的两种用法做对照
+& $py backend/core/evaluate_long.py                             # 片长尺度对照：全片聚类 vs 窗口内聚类（真值 = 9 段切片在片源里的原位窗口）
+& $py backend/core/evaluate_long.py --titles 魔女之旅 --no-clip-baseline   # 只跑一部
+& $py backend/core/main.py <video> --cluster-scope window       # 聚类范围压回单个 30 秒窗口
+& $py backend/core/main.py <video> --style real                 # 人工指定画风（3D CG / 真人机器分不开，见第五轮）
+& $py backend/core/main.py <video> --prefetch 0                 # 关掉解码预取，退回完全串行（对照/内存受限时）
+& $py backend/core/evaluate.py data/*.mp4 --min-character-seconds 0.9   # 按角色算的累计出镜时长门槛
+& $py backend/core/montage.py output/<stem> --clusters 18       # 按 character_id 拼接触印相表，肉眼核对聚类
+& $py backend/core/summarize.py output_raw                      # 汇总一批 windows.json：片段数 / 不重叠窗口上限
+& $py -m uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000   # Web 后端（别加 --reload）
+cd frontend; pnpm dev                                  # Web 前端 http://127.0.0.1:3000
+& $py -m pytest tests -q                               # 173 个纯逻辑单测，3s，不需要 GPU/模型/网络
 & $py -m pytest tests/test_streaming.py::TestDetectCuts -q
 & $py -m pytest "tests/test_main.py::TestSelectSegments::test_single_qualified_window" -q
 ```
 
 **CLI 默认参数 `data/1.mp4` 已不存在**（README 里的全部实测数字都出自那个 23 分钟视频，现已不在 `data/`），必须显式传视频路径。
 
-`tests/` 全部用合成数据（tmp_path 下现造小视频），改 IoU/聚类/选段/切镜逻辑先跑它。`tests/conftest.py` 把 `src/` 塞进 `sys.path`，因为 `main.py` 用**平铺导入**（`from config import Config`），**不是包**——新增模块沿用平铺导入。
+`tests/` 全部用合成数据（tmp_path 下现造小视频），改 IoU/聚类/选段/切镜逻辑先跑它。`tests/conftest.py` 把 `backend/core/` 塞进 `sys.path`，因为 `main.py` 用**平铺导入**（`from config import Config`），**不是包**——新增模块沿用平铺导入。
 
 ## 架构
 
-7 个阶段，主体在 `src/main.py`（约 1000 行，用 `# === N. 阶段名 ===` 分节）：
+7 个阶段，主体在 `backend/core/main.py`（约 1000 行，用 `# === N. 阶段名 ===` 分节）：
 
 ```
 流式解码 → 检测 → 过滤 → 跟踪 → 角色识别 → 选段 → 截取
@@ -90,18 +92,19 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 
 | 文件 | 职责 |
 |---|---|
-| `src/config.py` | 唯一的参数集中地（`Config` + `StyleProfile` dataclass），不做 I/O。新参数加在这里，不要散进逻辑 |
-| `src/detectors.py` | `Detection` 数据契约 + `Detector` 抽象基类 + `@register` 名称注册表 + 裁剪几何（`crop_bbox` / `expand_bbox`）+ 两个实现：imgutils YOLOv8 动漫脸、InsightFace SCRFD-10G 真人脸（含 5 点关键点与 ArcFace 对齐）。**新检测器加在这里** |
-| `src/embedders.py` | 身份特征注册表：`ccip`（动漫角色）与 `arcface`（真人脸）。统一接口 `differences(crop_paths) -> N×N 矩阵`，聚类阶段不关心是谁算的 |
-| `src/main.py` | 七阶段流水线 + CLI |
-| `src/sweep.py` | 在 `identity_threshold × min_events_per_window` 网格上重跑聚类与选段。视频只解码一次、身份特征只提一次，加格子几乎免费 |
-| `src/style.py` | 画风路由：抽帧判 **2d / 3d / real** 三分类 + `apply_style` 成套覆盖 Config（检测器 / 特征 / 阈值 / 外扩 / 尺寸门槛）。**2d/非2d 稳（26 段素材 21/21）；3d/real 机器分不开**，落进 `style_ambiguous_band` 就打警告，靠 `--style` 人工定 |
-| `src/frontal.py` | 正脸评分（纯几何、无 I/O）：真人/3D 走 SCRFD 5 点关键点算偏航，2D 走动漫眼检测器的**框位置**。判据挂在 `Detector.frontal_score` 上（和检测器绑死）。**加权与硬筛实测都无收益，默认全关** |
-| `src/montage.py` | 把一次运行的代表图按 `character_id` 拼成接触印相表（`--tracks` 可指向另一份聚类结果）。没有真值的完整片源只能这么核对聚类 |
-| `src/summarize.py` | 汇总一批 `windows.json`：轨迹/角色/片段数，以及**片段数 ÷ 不重叠窗口上限**——长片上最该盯的一列 |
-| `src/groundtruth.py` | 纯解析：文件名标注 → `GroundTruth`。不做 I/O、不碰视频 |
-| `src/evaluate_long.py` | **片长尺度**的对照评估。9 段切片都是从 `data/原始数据/` 里按整秒原位截出的（逐帧比对确认 shift=0），所以文件名真值同时也是**完整片源上 `[offset, offset+30)` 这个窗口的真值**——这补上了 README 第六之五节说的"缺片长尺度标注"。画风强制用真值，避开长片路由判错这个已知缺陷 |
-| `src/evaluate.py` | 召回率评估。复用 `sweep.py` 同款切分：扫一次视频、提一次特征，网格上只重跑聚类 |
+| `backend/core/config.py` | 唯一的参数集中地（`Config` + `StyleProfile` dataclass），不做 I/O。新参数加在这里，不要散进逻辑 |
+| `backend/core/detectors.py` | `Detection` 数据契约 + `Detector` 抽象基类 + `@register` 名称注册表 + 裁剪几何（`crop_bbox` / `expand_bbox`）+ 两个实现：imgutils YOLOv8 动漫脸、InsightFace SCRFD-10G 真人脸（含 5 点关键点与 ArcFace 对齐）。**新检测器加在这里** |
+| `backend/core/embedders.py` | 身份特征注册表：`ccip`（动漫角色）与 `arcface`（真人脸）。统一接口 `differences(crop_paths) -> N×N 矩阵`，聚类阶段不关心是谁算的 |
+| `backend/core/main.py` | 七阶段流水线 + CLI |
+| `backend/core/segments.py` | 选段重放：`windows_scan.json`（每个窗口起点的角色数，与 X 无关）+ 在它上面贪心选段。**不 import cv2/onnxruntime**，`backend/` 直接引用同一份实现，改 X 不会两边走偏 |
+| `backend/core/sweep.py` | 在 `identity_threshold × min_events_per_window` 网格上重跑聚类与选段。视频只解码一次、身份特征只提一次，加格子几乎免费 |
+| `backend/core/style.py` | 画风路由：抽帧判 **2d / 3d / real** 三分类 + `apply_style` 成套覆盖 Config（检测器 / 特征 / 阈值 / 外扩 / 尺寸门槛）。**2d/非2d 稳（26 段素材 21/21）；3d/real 机器分不开**，落进 `style_ambiguous_band` 就打警告，靠 `--style` 人工定 |
+| `backend/core/frontal.py` | 正脸评分（纯几何、无 I/O）：真人/3D 走 SCRFD 5 点关键点算偏航，2D 走动漫眼检测器的**框位置**。判据挂在 `Detector.frontal_score` 上（和检测器绑死）。**加权与硬筛实测都无收益，默认全关** |
+| `backend/core/montage.py` | 把一次运行的代表图按 `character_id` 拼成接触印相表（`--tracks` 可指向另一份聚类结果）。没有真值的完整片源只能这么核对聚类 |
+| `backend/core/summarize.py` | 汇总一批 `windows.json`：轨迹/角色/片段数，以及**片段数 ÷ 不重叠窗口上限**——长片上最该盯的一列 |
+| `backend/core/groundtruth.py` | 纯解析：文件名标注 → `GroundTruth`。不做 I/O、不碰视频 |
+| `backend/core/evaluate_long.py` | **片长尺度**的对照评估。9 段切片都是从 `data/原始数据/` 里按整秒原位截出的（逐帧比对确认 shift=0），所以文件名真值同时也是**完整片源上 `[offset, offset+30)` 这个窗口的真值**——这补上了 README 第六之五节说的"缺片长尺度标注"。画风强制用真值，避开长片路由判错这个已知缺陷 |
+| `backend/core/evaluate.py` | 召回率评估。复用 `sweep.py` 同款切分：扫一次视频、提一次特征，网格上只重跑聚类 |
 | `README.md` | 逐阶段数据流 + 决策理由 + 多个被否掉的旧方案及其实测数据。**流水线行为变了要同步更新它**；但其中的实测数字属于已不存在的 `data/1.mp4`，别当现状引用 |
 
 `scan_video` 停在轨迹层（不聚类、不选段），因为后续阶段与阈值无关、可在不重扫视频的前提下反复重跑——`sweep.py` 正是这么用的。改动时保持这个切分。
@@ -115,6 +118,19 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 - 代表裁剪图靠**在线擂台**（`FaceTracker._offer`，比 `blur_var × confidence`）选出，不能等轨迹结束再回看。
 - `--viz N` 用蓄水池采样，样本当场压成 JPEG 字节才进池子。
 - 任何"需要回看某一帧"的新功能（**正脸/眼睛判定就是**）必须**在当帧算完、结果挂在 `Detection` 上带下去**，不能留到后面阶段再取像素。
+
+### Web 界面（`backend/` + `frontend/`，2026-08-21）
+
+本机界面：上传 → 分析 → 结果页拖 X 实时看片段 → 打包下载。
+跑法、已定决策、存储布局与接口一览见 [README.md](./README.md) 第十节。
+
+- **后端是平铺导入**（`import db`、`from settings import settings`），跑法 `uvicorn app:app --app-dir backend`。**别开 `--reload`**：进程池和 Manager 会跟着重启，跑到一半的任务被切断。
+- **Web 进程不 import `backend/core/main.py`**：那会把 cv2 / onnxruntime / imgutils 拖进来几百 MB 常驻。只 import `config.py` 和 `segments.py`（`backend/pipeline.py` 是这道边界）；重依赖只在 worker 子进程里。
+- **流水线只加了三个可选钩子，默认行为不变**：`windows_scan.json`（见文件表）、`process_video(out_name=...)`（素材都叫 source.mp4，输出目录要用原始中文名，否则互相覆盖）、`on_progress(stage, fraction)`（驱动进度条；回调抛异常即中断扫描，取消任务就靠它）。
+- **item 的 `running` 状态是推导出来的**，数据库里没有：进程池只在结束时给回调，开跑这件事父进程没有钩子（`jobs.effective_status`）。
+- **鉴权是 HttpOnly cookie 不是请求头**：`<video src>` / `<img src>` / 下载链接都是浏览器直接发的，带不了自定义头。
+- 分析等价 `--no-clip`；预览用 Range 播原视频不编码；只有点下载才现场编码。
+- 前端**不引 Tailwind**，只用 `frontend/app/assets/css/tokens.css` + SFC 里的 `<style scoped>`；设计源是 `design/*.dc.html`（git 忽略，不要改）。
 
 ### 其他必须遵守的点
 
@@ -134,9 +150,9 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 ### 第一轮：重启后的四项（2026-08-18 上午）
 
 1. **窗口与门槛**：`window_seconds = 30`（需求口径，别再当可调参数）、`min_events_per_window = 4`（真值下界）。
-2. **画风路由**：`src/style.py`。
+2. **画风路由**：`backend/core/style.py`。
 3. **正脸过滤（第一代）**：`config.require_eyes` + `--eyes N`，已实现但**默认关闭（0），因为实测有害**。第三轮用更好的判据重做了一遍，结论不变，见下。detect_eyes 是动漫眼检测器，对真人/3D 几乎不触发（爱情神话_1525s 23 条轨迹 → 0），2D 上各自调优后 F1 也是 0.89 vs 0.82。**不要因为它"看起来该开"就把默认值改回 2**，README 第六之二节有完整 A/B。
-4. **召回评估**：`src/evaluate.py` + `src/groundtruth.py`。
+4. **召回评估**：`backend/core/evaluate.py` + `backend/core/groundtruth.py`。
 
 结果：macro 召回 0.96、macro F1 0.90。
 
@@ -150,14 +166,14 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 
 ### 第三轮：完整片源实测 + 正脸检测（2026-08-18 晚）
 
-1. **`--no-clip` + `src/montage.py`**：长片实测的两件工具。前者跳过片段编码只写 JSON，后者把代表图按 `character_id` 拼成接触印相表——没有真值时唯一能核对聚类的手段。
-2. **`src/frontal.py` 正脸评分**：真人/3D 用 SCRFD 5 点关键点纯几何算偏航（零成本、目视校准很干净），2D 用动漫眼检测器的**框位置**（不是旧的数眼睛）。主用法是给代表图擂台加权（`frontal_weight`），**不丢轨迹**。
+1. **`--no-clip` + `backend/core/montage.py`**：长片实测的两件工具。前者跳过片段编码只写 JSON，后者把代表图按 `character_id` 拼成接触印相表——没有真值时唯一能核对聚类的手段。
+2. **`backend/core/frontal.py` 正脸评分**：真人/3D 用 SCRFD 5 点关键点纯几何算偏航（零成本、目视校准很干净），2D 用动漫眼检测器的**框位置**（不是旧的数眼睛）。主用法是给代表图擂台加权（`frontal_weight`），**不丢轨迹**。
    - **实测无收益，默认全关**：加权在 9 段素材上 2d 0.95→0.94、3d 0.97→0.97、real 0.94→0.92（抖动量级），长片上 `魔女之旅` 54→57 个角色、耗时 +27%；硬门槛（`min_frontal_score=0.3`）real F1 0.94→**0.50**，和 `require_eyes` 同一个失败模式。
    - **不要因为"判据这次是对的"就把默认值打开**。判据确实是对的（真人支路 0.9+ 全正脸、0.0 全侧脸），崩掉的是**用法**：真值只数"有几个不同角色"，某个角色可能全片只有侧脸出镜，丢掉它 = 直接少一个真值身份。正脸判定不该出现在任何会丢弃轨迹的位置。README 第六之四节有完整 A/B。
 
 ### ⚠️ 片长尺度上这套参数会塌（第三轮实测，README 第六之五节）
 
-**上面所有数字都出自 9 段各 30 秒的素材**。压到 `data/原始数据/` 下 **17 段完整片源（共 7.3 小时）**上（`src/main.py data/原始数据/*.mp4 --no-clip --output-dir output_raw` + `src/summarize.py output_raw`）：
+**上面所有数字都出自 9 段各 30 秒的素材**。压到 `data/原始数据/` 下 **17 段完整片源（共 7.3 小时）**上（`backend/core/main.py data/原始数据/*.mp4 --no-clip --output-dir output_raw` + `backend/core/summarize.py output_raw`）：
 
 - 一趟跑完，**无崩溃 / 无内存问题**。吞吐 2D 约 **4 倍实时**（24 分钟 1080p 片 ≈ 363 秒），真人/CG 约 **8 倍**；流式内存约束在片长上成立。
 - **`min_events_per_window = 4` 形同虚设：676 / 884 个不重叠窗口合格 = 76% 的片长被判为合格片段**（`亚托莉` 46/47）。唯一正常的是双人剧 `高木同学`（19/48），说明门槛没在筛选、只在反映素材的角色密度。
@@ -181,13 +197,13 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 
 还没试、值得试：⓪ 先修画风路由（唯一一个判错就全盘用错参数的环节，且已实测翻车，成本最低）；① 补代表图质量门槛（真人对齐图的黑边占比可直接从仿射矩阵算，不用看像素；以及整体亮度过低）；② `min_events_per_window` 按片长重定或改成相对口径；③ 把最短出镜时长改成**按角色**算（聚类之后、选段之前）；④ ~~先在场景/镜头邻域内合并、再跨场景合并~~ → **已按更粗的粒度做掉了（窗口内聚类，见第四轮）**；更细的场景邻域粒度仍可试，尤其针对窗内轨迹稀疏时合过头的那类误差。
 
-**另一条结论同样重要：现在这套真值测不出片长尺度的问题。** 9 段各 30 秒的样本里几乎每条轨迹都对应一个真值身份，任何过滤都只会掉分。要继续往前走，先得有片长尺度的标注。→ **第四轮解决了这一条**：9 段切片本来就是片源的原位窗口，`src/evaluate_long.py` 直接拿它当片长尺度真值。
+**另一条结论同样重要：现在这套真值测不出片长尺度的问题。** 9 段各 30 秒的样本里几乎每条轨迹都对应一个真值身份，任何过滤都只会掉分。要继续往前走，先得有片长尺度的标注。→ **第四轮解决了这一条**：9 段切片本来就是片源的原位窗口，`backend/core/evaluate_long.py` 直接拿它当片长尺度真值。
 
 ### 第四轮：聚类范围压回单个 30 秒窗口（2026-08-18 晚，README 第六之六节）
 
 **这是目前唯一在片长尺度上真正见效、且在 30 秒真值集上零代价的改动，已设为默认。**
 
-1. **先白捡了片长尺度的真值**：9 段切片都是从 `data/原始数据/` 按整秒**原位**截出的（逐帧比对确认全部 `shift=0`），所以文件名里的「跨镜头身份去重后期望」**同时就是完整片源上 `[offset, offset+30)` 这个窗口的真值**。这补上了第三轮小结里"现在这套真值测不出片长尺度的问题"缺的那一块，不用新标注。工具是 `src/evaluate_long.py`。
+1. **先白捡了片长尺度的真值**：9 段切片都是从 `data/原始数据/` 按整秒**原位**截出的（逐帧比对确认全部 `shift=0`），所以文件名里的「跨镜头身份去重后期望」**同时就是完整片源上 `[offset, offset+30)` 这个窗口的真值**。这补上了第三轮小结里"现在这套真值测不出片长尺度的问题"缺的那一块，不用新标注。工具是 `backend/core/evaluate_long.py`。
 2. **`config.cluster_scope`（默认 `"window"`）**：需求只问"这 30 秒里有几个不同角色"，从不需要全片一致的身份编号。complete-linkage 被离群点卡住的概率随轨迹数增长，把 N 从"全片 788~1100 条"降到"窗内 6~91 条"，过拆就消失了。差异矩阵仍只算一次（全片），窗口聚类只是取子矩阵重跑 linkage（`IdentityIndex.count()`，按行号元组缓存），耗时无可测增加。
 3. **`track.character_id` 仍是全片口径**（`crops/` 与 `montage.py` 唯一的身份线索）；片段里 `character_ids` 是全片 id 只作溯源，`character_count` 才是计数口径，两者在窗口口径下可以不等长。
 
@@ -237,7 +253,7 @@ main() → run_pipeline() → process_video() → scan_video()   ← 唯一的�
 - **各片源差异极大**：双人剧 `高木同学` X=3 就砍到 40%，`魔女之旅` 要 X=9 才到同一水平。别指望一个 X 通吃。
 - 改 X 只需 `--min-events X`，不用重跑检测或聚类。
 
-### 当前基线（2026-08-18 实测，`src/evaluate.py data/*.mp4`）
+### 当前基线（2026-08-18 实测，`backend/core/evaluate.py data/*.mp4`）
 
 出厂配置下 9 段素材：**macro 召回 0.98、micro 0.97、macro F1 0.96、画风路由 9/9（三分类）**，9 段里 6 段角色数与真值完全一致。分风格 F1：2D 0.95 / 3D CG 1.00 / 真人 0.92。逐次运行有 ±1 个角色的抖动（cuDNN 算法选择非确定，边界上的一对轨迹会翻面），量级在真值噪声之下。逐视频表格与阈值网格在 [README.md](./README.md) 第六之二节。要点：
 

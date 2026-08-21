@@ -23,9 +23,9 @@
 ## 怎么跑（PowerShell，项目根目录）
 
     $py = "D:\\Programs\\DevEnvironments\\Anaconda\\anaconda3\\envs\\myenv\\python.exe"
-    & $py src/evaluate.py data/*.mp4                    # 用 config 当前参数（含画风路由）
-    & $py src/evaluate.py data/*.mp4 --threshold 0.05,0.1,0.178,0.25   # 按阈值网格扫召回
-    & $py src/evaluate.py data/*.mp4 --eyes 2           # 打开正脸过滤做对照（默认关）
+    & $py backend/core/evaluate.py data/*.mp4                    # 用 config 当前参数（含画风路由）
+    & $py backend/core/evaluate.py data/*.mp4 --threshold 0.05,0.1,0.178,0.25   # 按阈值网格扫召回
+    & $py backend/core/evaluate.py data/*.mp4 --eyes 2           # 打开正脸过滤做对照（默认关）
 
 产出：控制台表格 + <output-dir>/recall.csv（每次重跑覆盖，幂等）。
 
