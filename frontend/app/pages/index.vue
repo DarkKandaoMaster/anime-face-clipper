@@ -26,6 +26,7 @@ type Row = {
   barWidth: string
   action: string
   actionColor: string
+  deletable: boolean
 }
 
 const STATE: Record<string, { text: string; color: string }> = {
@@ -64,9 +65,11 @@ const rows = computed<Row[]>(() => {
       stateColor: state.color,
       pctText: a.status === 'running' ? `${a.percent}%` : '',
       barWidth: a.status === 'done' ? '100%' : `${a.percent}%`,
+      // 删除是独立按钮，主操作只留"看结果 / 取消"，两者不再共用一个位置。
       action: a.status === 'done' ? '查看结果'
-        : ['queued', 'running'].includes(a.status) ? '取消' : '移除',
+        : ['queued', 'running'].includes(a.status) ? '取消' : '',
       actionColor: a.status === 'done' ? 'var(--am)' : 'var(--mut)',
+      deletable: !['queued', 'running'].includes(a.status),
     }
   })
   const fromUploads: Row[] = w.uploads.value.map((u) => ({
@@ -85,6 +88,7 @@ const rows = computed<Row[]>(() => {
     barWidth: `${u.percent}%`,
     action: u.error ? '移除' : '上传中',
     actionColor: 'var(--mut)',
+    deletable: false,
   }))
   return [...fromAssets, ...fromUploads]
 })
@@ -146,7 +150,11 @@ function pick(row: Row) {
   const asset = w.assets.value.find((a) => a.id === row.id)!
   if (asset.status === 'done') return navigateTo(`/results/${asset.task_id}?asset=${asset.id}`)
   if (['queued', 'running'].includes(asset.status) && asset.task_id) return w.cancel(asset.task_id)
-  return w.remove(asset.id)
+}
+
+// 删除会连素材文件和分析结果一起删掉，不可撤销，但按要求不做二次确认。
+function del(row: Row) {
+  w.remove(row.id!)
 }
 
 function onDrop(e: DragEvent) {
@@ -263,8 +271,9 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div style="display:flex;justify-content:flex-end">
-                <button class="gbtn sm" :style="{ color: row.actionColor }" @click="pick(row)">{{ row.action }}</button>
+              <div style="display:flex;justify-content:flex-end;gap:6px">
+                <button v-if="row.action" class="gbtn sm" :style="{ color: row.actionColor }" @click="pick(row)">{{ row.action }}</button>
+                <button v-if="row.deletable" class="gbtn sm del" @click="del(row)">删除</button>
               </div>
             </div>
           </div>
@@ -365,7 +374,7 @@ main {
 }
 .thead, .trow {
   display: grid;
-  grid-template-columns: 88px minmax(0, 1fr) 56px 64px 64px 236px 84px;
+  grid-template-columns: 88px minmax(0, 1fr) 56px 64px 64px 236px 132px;
   gap: 12px; align-items: center; padding: 9px 16px;
 }
 .thead {
@@ -415,6 +424,7 @@ main {
 }
 .gbtn:hover { border-color: var(--line4); color: var(--fg-hi); }
 .gbtn.sm { height: 26px; padding: 0 9px; font-size: 11.5px; }
+.gbtn.del:hover { border-color: var(--err); color: var(--err); }
 .abtn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
   height: 32px; padding: 0 14px;
