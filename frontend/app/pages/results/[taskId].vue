@@ -33,6 +33,12 @@ type Payload = {
   items: Item[]
 }
 
+/** 滑条量程；两端不显示刻度数字，改由 xValLeft 把当前值贴在把手下方。 */
+const X_MIN = 1
+const X_MAX = 20
+const SLIDER_W = 180
+const THUMB_W = 9
+
 const x = ref(4)
 const data = ref<Payload | null>(null)
 const selected = ref(0)
@@ -41,6 +47,11 @@ const sheetFor = ref<Item | null>(null)
 const player = ref<HTMLVideoElement | null>(null)
 
 const WIN = computed(() => data.value?.window_seconds ?? 30)
+
+/** thumb 中心的横坐标：轨道两端各被 thumb 占掉半个宽度，不能直接按百分比算。 */
+const xValLeft = computed(
+  () => ((x.value - X_MIN) / (X_MAX - X_MIN)) * (SLIDER_W - THUMB_W) + THUMB_W / 2 + 'px',
+)
 
 /** 看哪个片源由 ?asset= 决定；没带就落到第一个——从工作台点进来就是这条路。 */
 const item = computed(() => {
@@ -193,27 +204,28 @@ function downloadAll() {
       </header>
 
       <div class="ctrl">
-        <div style="display:flex;align-items:center;gap:12px;flex:none">
-          <div style="display:flex;flex-direction:column;gap:1px">
-            <span class="label">合格门槛</span>
-            <span style="color:var(--mut);font-size:11.5px">{{ WIN }} 秒窗口内至少出现</span>
-          </div>
-          <span class="xnum">{{ x }}</span>
-          <div style="display:flex;flex-direction:column;gap:3px">
-            <input
-              class="sl" type="range" min="2" max="10" step="1"
-              :value="x" @input="setX(Number(($event.target as HTMLInputElement).value))"
-            >
-            <div style="display:flex;align-items:center;justify-content:space-between;color:var(--dim);font-size:9.5px;font-family:var(--mono)">
-              <span>2</span><span>个不同角色</span><span>10</span>
+        <div style="display:flex;flex-direction:column;gap:3px;flex:none">
+          <span class="label">合格门槛</span>
+          <div class="xrow">
+            <span class="xtext">{{ WIN }} 秒窗口内至少出现</span>
+            <!-- 滑条两端不标 2/10：量程本身不重要，读的人只关心当前值。
+                 当前值跟着 thumb 走（xValLeft 用滑条宽与 thumb 宽反算），
+                 不居中固定，否则拖到两端时数字和把手对不上。 -->
+            <div class="xslot" :style="{ width: SLIDER_W + 'px' }">
+              <input
+                class="sl" type="range" :min="X_MIN" :max="X_MAX" step="1"
+                :value="x" @input="setX(Number(($event.target as HTMLInputElement).value))"
+              >
+              <span class="xval" :style="{ left: xValLeft }">{{ x }}</span>
             </div>
+            <span class="xtext">个不同角色</span>
           </div>
         </div>
 
         <span style="width:1px;height:40px;background:var(--line)" />
 
         <div style="display:flex;flex-direction:column;gap:4px;flex:none">
-          <span class="label">门槛敏感度 · 点柱可直接切换</span>
+          <span class="label">门槛敏感度</span>
           <!-- 柱子与刻度分成两排：画板里它们同在一个 28px 的行里，靠柱子永远矮
                才没露馅；本项目的比例能顶到 100%（X 小的时候几乎每个窗口都合格），
                同一个盒子会把数字顶到标题上去。 -->
@@ -420,14 +432,22 @@ header {
   height: var(--ctrlbar); flex: none; padding: 0 18px;
   border-bottom: 1px solid var(--line); background: var(--k2); box-shadow: var(--lift);
 }
-.xnum {
-  color: var(--am); font-size: 30px; font-weight: 600; font-family: var(--mono);
-  line-height: 1; letter-spacing: -0.02em;
+.xrow { display: flex; align-items: center; gap: 10px; }
+.xtext { color: var(--mut); font-size: 12.5px; }
+/* 只有 thumb 那 18px 参与布局，数字挂在下方溢出——这样滑条轨道和左右两段
+   文字才是真的水平对齐，控制栏 68px 的余量够放这一行溢出。 */
+.xslot { position: relative; display: flex; align-items: center; height: 18px; }
+.xval {
+  position: absolute; top: 5px; transform: translateX(-50%);
+  color: var(--am); font-size: 25px; font-weight: 600; font-family: var(--mono);
+  line-height: 1; letter-spacing: -0.02em; pointer-events: none;
 }
 .sl {
-  -webkit-appearance: none; appearance: none;
-  width: 180px; height: 3px; border-radius: 0; background: var(--line2);
+  -webkit-appearance: none; appearance: none; display: block;
+  width: 100%; height: 3px; border-radius: 0; background: var(--line2);
   outline: none; cursor: pointer;
+  /* 只挪滑条自己（相对定位不占位），左右两段文字与标题的位置保持不变 */
+  position: relative; top: -13px;
 }
 .sl::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
