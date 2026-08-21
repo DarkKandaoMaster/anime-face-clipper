@@ -3,3 +3,10 @@
 __pycache__/
 自动化识别项目不可行性说明.doc
 自动化识别项目不可行性说明.docx
+/storage/
+/design/*.html
+node_modules/
+.nuxt/
+.output/
+.env
+.env.*

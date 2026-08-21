@@ -1,0 +1,80 @@
+/* 设计令牌，唯一来源：design/Dashboard.dc.html 的 :root
+   改配色只改这里。数值都是画板里的原值，不要四舍五入到 4/8px 栅格。 */
+:root {
+  /* 中性近黑五级 */
+  --k0: #0a0c0f;   /* 页面 */
+  --k1: #12151a;   /* 面板：侧栏 顶栏 分组 */
+  --k2: #171b21;   /* 抬升：控制条 卡片 内嵌块 */
+  --k3: #1f242c;   /* 悬停 / 轨道底 */
+
+  --line: #242a33;
+  --line2: #39414d;
+  --line3: #4b5462; /* 卡片悬停描边 */
+  --line4: #5b6573; /* 幽灵按钮悬停描边 */
+
+  --fg-hi: #f0f3f7;
+  --fg: #c3cad3;
+  --mut: #79828f;
+  --dim: #565f6c;
+
+  /* 唯一强调色。只用在四处：激活项左侧竖条、主按钮、时间轴命中块、门槛虚线 */
+  --am: #e8a33d;
+  --am-2: #f3bd6e;                        /* 悬停 */
+  --am-dim: rgb(232 163 61 / 0.13);
+  --am-soft: rgb(232 163 61 / 0.34);      /* 未选中的命中块 */
+  --am-edge: rgb(232 163 61 / 0.6);
+  --am-ink: #16110a;                      /* 琥珀底上的字 */
+  --am-label: #f0d3a4;
+
+  --lime: #8fbf5f;                        /* 只表示完成 */
+
+  /* 用内高光代替阴影 */
+  --lift: inset 0 1px 0 rgb(255 255 255 / 0.035);
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+
+  --r: 3px;      /* 常规圆角 */
+  --r-sm: 2px;   /* 数据块 */
+
+  --h-xs: 22px;  /* 小方按钮 */
+  --h-sm: 28px;
+  --h: 29px;     /* 导航行 / 幽灵按钮 */
+  --h-lg: 31px;  /* 主按钮 */
+
+  --sidebar: 214px;
+  --inspector: 296px;
+  --topbar: 50px;
+  --ctrlbar: 68px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #__nuxt { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--k0);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--am); text-decoration: none; }
+a:hover { color: var(--am-2); }
+
+button { font-family: inherit; }
+
+/* 数字一律等宽对齐 */
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* 小标题：10px 大写 0.16em */
+.label {
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
