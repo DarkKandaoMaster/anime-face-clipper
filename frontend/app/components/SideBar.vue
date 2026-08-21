@@ -1,15 +1,38 @@
 <script setup lang="ts">
-// 两个页面共用的左栏：品牌 + 工作区导航 + 中间区（插槽）+ 底部汇总卡（插槽）。
+// 两个页面共用的左栏：品牌 + 工作区导航 + 片源列表 + 底部汇总卡（插槽）。
 // 尺寸与配色全部照 design/Main.dc.html、design/Dashboard.dc.html 的原值。
-const props = defineProps<{ active: 'work' | 'results'; resultsTo?: string }>()
+import type { AssetRow } from '~/composables/useWorkbench'
+
+// counts：结果页按当前 X 现算的命中数，覆盖 /api/assets 里按默认 X 存的那份。
+const props = defineProps<{
+  active: 'work' | 'results'
+  activeAsset?: string | null
+  counts?: Record<string, number>
+}>()
 
 const router = useRouter()
+const w = useWorkbench()
+const authed = useAuthed()
 
-async function goResults() {
-  if (props.resultsTo) return router.push(props.resultsTo)
-  // 没指定就跳最近一个任务；一个都没有就待在原地。
-  const tasks = await apiGet<{ id: string }[]>('/api/tasks').catch(() => [])
-  if (tasks.length) router.push(`/results/${tasks[0].id}`)
+// 片源列表两个页面都要，所以数据源放在这里，不再由结果页现拉。
+const sources = computed(() => w.assets.value.filter((a) => a.status === 'done' && a.task_id))
+
+// 工作台自己会拉素材列表，结果页不会——空了才补一次。
+watch(authed, (ok) => {
+  if (ok && !w.assets.value.length) w.refresh()
+}, { immediate: true })
+
+const hitsOf = (a: AssetRow) => props.counts?.[a.id] ?? a.num_segments ?? 0
+// 结果页里片源名是不带扩展名的 stem，左栏跟它保持一致。
+const titleOf = (a: AssetRow) => a.filename.replace(/\.[^.]+$/, '')
+
+const open = (a: AssetRow) => router.push(`/results/${a.task_id}?asset=${a.id}`)
+
+function goResults() {
+  if (props.active === 'results') return
+  // 从工作台进结果页：自动选中第一个片源。
+  const first = sources.value[0]
+  if (first) open(first)
 }
 </script>
 
@@ -41,7 +64,19 @@ async function goResults() {
     </div>
 
     <div class="middle">
-      <slot name="middle" />
+      <div class="srclist">
+        <span class="label" style="padding:4px 7px 6px">片源</span>
+        <div v-if="!sources.length" class="srcempty">还没有分析完成的片源</div>
+        <div
+          v-for="s in sources" :key="s.id"
+          class="srcrow" :class="{ on: s.id === activeAsset }"
+          @click="open(s)"
+        >
+          <span class="dot" :style="{ background: hitsOf(s) ? (s.id === activeAsset ? 'var(--am)' : 'var(--am-soft)') : 'var(--line)' }" />
+          <span class="title" :style="{ color: s.id === activeAsset ? 'var(--fg-hi)' : 'var(--mut)' }">{{ titleOf(s) }}</span>
+          <span class="num" style="font-size:11px" :style="{ color: hitsOf(s) ? 'var(--fg)' : 'var(--dim)' }">{{ hitsOf(s) }}</span>
+        </div>
+      </div>
     </div>
 
     <div class="foot">
@@ -100,6 +135,19 @@ async function goResults() {
   color: var(--fg-hi);
 }
 .middle { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.srclist { display: flex; flex-direction: column; gap: 1px; padding: 0 9px; overflow: auto; }
+.srcempty { padding: 4px 8px; color: var(--dim); font-size: 11px; }
+.srcrow {
+  display: flex; align-items: center; gap: 8px; height: var(--h); padding: 0 8px;
+  border-radius: var(--r); cursor: pointer; transition: background 0.12s ease;
+}
+.srcrow:hover { background: var(--k3); }
+.srcrow.on { background: var(--k2); }
+.dot { width: 4px; height: 14px; flex: none; border-radius: 1px; }
+.srcrow .title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px;
+}
 .foot { flex: none; padding: 11px 9px; border-top: 1px solid var(--line); }
 .card {
   display: flex;

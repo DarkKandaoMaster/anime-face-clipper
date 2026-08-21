@@ -42,19 +42,33 @@ const player = ref<HTMLVideoElement | null>(null)
 
 const WIN = computed(() => data.value?.window_seconds ?? 30)
 
-/** 全部片源的片段拉平成一条列表，选中态就是它的下标（画板里的 flat）。 */
+/** 看哪个片源由 ?asset= 决定；没带就落到第一个——从工作台点进来就是这条路。 */
+const item = computed(() => {
+  const items = data.value?.items ?? []
+  return items.find((i) => i.asset_id === route.query.asset) ?? items[0] ?? null
+})
+
+/** 只有当前片源的片段进列表，选中态就是它的下标（画板里的 flat）。 */
 const flat = computed(() =>
-  (data.value?.items ?? []).flatMap((item) =>
-    item.segments.map((segment) => ({ item, segment })),
-  ),
+  (item.value?.segments ?? []).map((segment) => ({ item: item.value!, segment })),
 )
 const hits = computed(() => flat.value.length)
 const current = computed(() => flat.value[Math.min(selected.value, hits.value - 1)] ?? null)
+watch(item, () => (selected.value = 0))
+
+// 汇总卡与打包导出仍是整个任务的口径（后端只能整包下），中间那栏才是单个片源。
 const totalDuration = computed(() =>
   (data.value?.items ?? []).reduce((s, i) => s + i.duration, 0),
 )
+const totalHits = computed(() =>
+  (data.value?.items ?? []).reduce((s, i) => s + i.segments.length, 0),
+)
 const hitPct = computed(() =>
-  totalDuration.value ? Math.round((hits.value * WIN.value * 100) / totalDuration.value) + '%' : '0%',
+  totalDuration.value ? Math.round((totalHits.value * WIN.value * 100) / totalDuration.value) + '%' : '0%',
+)
+/** 左栏各片源在当前 X 下的命中数；不在本任务里的片源用 /api/assets 存的那份。 */
+const counts = computed(() =>
+  Object.fromEntries((data.value?.items ?? []).map((i) => [i.asset_id, i.segments.length])),
 )
 
 async function load() {
@@ -90,38 +104,22 @@ function shape(item: Item) {
   return { line, area: `${line} L1000,${H} L0,${H} Z`, xy: (H - (x.value / top) * H).toFixed(1) }
 }
 
-const groups = computed(() =>
-  (data.value?.items ?? [])
-    .filter((item) => item.segments.length)
-    .map((item) => {
-      const geometry = shape(item)
-      const base = flat.value.findIndex((f) => f.item.item_id === item.item_id)
-      return {
-        item,
-        ...geometry,
-        hitText: `${item.segments.length} 段 · ${clock(item.segments.length * WIN.value)}`,
-        ticks: [0, 1, 2, 3, 4].map((t) => clock((item.duration * t) / 4)),
-        entries: item.segments.map((segment, i) => ({
-          segment,
-          index: base + i,
-          left: ((segment.start / item.duration) * 100).toFixed(2) + '%',
-          width: ((WIN.value / item.duration) * 100).toFixed(2) + '%',
-        })),
-      }
-    }),
-)
-
-const nav = computed(() =>
-  (data.value?.items ?? []).map((item) => {
-    const first = flat.value.findIndex((f) => f.item.item_id === item.item_id)
-    return {
-      item,
-      hits: item.segments.length,
-      on: current.value?.item.item_id === item.item_id,
-      first: first < 0 ? selected.value : first,
-    }
-  }),
-)
+const group = computed(() => {
+  const it = item.value
+  if (!it?.segments.length) return null
+  return {
+    item: it,
+    ...shape(it),
+    hitText: `${it.segments.length} 段 · ${clock(it.segments.length * WIN.value)}`,
+    ticks: [0, 1, 2, 3, 4].map((t) => clock((it.duration * t) / 4)),
+    entries: it.segments.map((segment, i) => ({
+      segment,
+      index: i,
+      left: ((segment.start / it.duration) * 100).toFixed(2) + '%',
+      width: ((WIN.value / it.duration) * 100).toFixed(2) + '%',
+    })),
+  }
+})
 
 const cropUrl = (item: Item, characterId: number) =>
   `/api/tasks/${taskId}/${encodeURIComponent(item.stem)}/crops/${characterId}`
@@ -162,7 +160,7 @@ function downloadOne() {
 }
 
 function downloadAll() {
-  if (!hits.value) return
+  if (!totalHits.value) return
   window.location.href = `/api/tasks/${taskId}/download?x=${x.value}`
 }
 </script>
@@ -170,25 +168,11 @@ function downloadAll() {
 <template>
   <div class="page">
     <AccessGate />
-    <SideBar active="results" :results-to="`/results/${taskId}`">
-      <template #middle>
-        <div class="srclist">
-          <span class="label" style="padding:4px 7px 6px">片源</span>
-          <div
-            v-for="n in nav" :key="n.item.item_id"
-            class="srcrow" :class="{ on: n.on }"
-            @click="selected = n.first"
-          >
-            <span class="dot" :style="{ background: n.hits ? (n.on ? 'var(--am)' : 'var(--am-soft)') : 'var(--line)' }" />
-            <span class="title" :style="{ color: n.on ? 'var(--fg-hi)' : 'var(--mut)' }">{{ n.item.title }}</span>
-            <span class="num" style="font-size:11px" :style="{ color: n.hits ? 'var(--fg)' : 'var(--dim)' }">{{ n.hits }}</span>
-          </div>
-        </div>
-      </template>
+    <SideBar active="results" :active-asset="item?.asset_id ?? null" :counts="counts">
       <template #footer>
         <span class="label">本次汇总</span>
         <div class="kv"><span>总片长</span><span class="num">{{ clock(totalDuration) }}</span></div>
-        <div class="kv"><span>命中片段</span><span class="num" style="color:var(--am)">{{ hits }} 段</span></div>
+        <div class="kv"><span>命中片段</span><span class="num" style="color:var(--am)">{{ totalHits }} 段</span></div>
         <div class="kv"><span>占总片长</span><span class="num">{{ hitPct }}</span></div>
       </template>
     </SideBar>
@@ -198,13 +182,13 @@ function downloadAll() {
         <span style="color:var(--fg-hi);font-size:13.5px;font-weight:600;letter-spacing:-0.012em">结果</span>
         <span class="pill">{{ data?.items.length ?? 0 }} 个片源 · 分析完成</span>
         <span style="flex:1" />
-        <button class="gbtn" :disabled="!current" @click="sheetFor = current?.item ?? null">
+        <button class="gbtn" :disabled="!item" @click="sheetFor = item">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5Z" /><path d="m3 12 9 5 9-5" /></svg>
           角色印相表
         </button>
-        <button class="abtn" :disabled="!hits" @click="downloadAll">
+        <button class="abtn" :disabled="!totalHits" @click="downloadAll">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3" /><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="m7 10 5 5 5-5" /></svg>
-          打包导出 {{ hits }} 段
+          打包导出 {{ totalHits }} 段
         </button>
       </header>
 
@@ -275,25 +259,25 @@ function downloadAll() {
             <span style="color:var(--dim);font-size:11.5px;font-family:var(--mono)">把滑块往左拖</span>
           </div>
 
-          <section v-for="g in groups" :key="g.item.item_id">
+          <section v-if="group">
             <div style="display:flex;align-items:center;gap:9px">
               <span style="width:4px;height:13px;flex:none;border-radius:1px;background:var(--am)" />
-              <span class="stitle">{{ g.item.title }}</span>
-              <span class="tag">{{ styleLabel(g.item.style) }}</span>
-              <span style="color:var(--dim);font-size:11px;font-family:var(--mono)">{{ clock(g.item.duration) }}</span>
+              <span class="stitle">{{ group.item.title }}</span>
+              <span class="tag">{{ styleLabel(group.item.style) }}</span>
+              <span style="color:var(--dim);font-size:11px;font-family:var(--mono)">{{ clock(group.item.duration) }}</span>
               <span style="flex:1" />
-              <span style="color:var(--am);font-size:11.5px;font-family:var(--mono);font-variant-numeric:tabular-nums">{{ g.hitText }}</span>
+              <span style="color:var(--am);font-size:11.5px;font-family:var(--mono);font-variant-numeric:tabular-nums">{{ group.hitText }}</span>
             </div>
 
             <div style="display:flex;flex-direction:column;gap:4px">
               <div class="timeline">
                 <svg viewBox="0 0 1000 56" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%">
-                  <path :d="g.area" fill="rgb(121 130 143 / 0.16)" />
-                  <path :d="g.line" fill="none" stroke="#79828f" stroke-width="1" vector-effect="non-scaling-stroke" />
-                  <line x1="0" x2="1000" :y1="g.xy" :y2="g.xy" stroke="#e8a33d" stroke-width="1" stroke-dasharray="5 4" vector-effect="non-scaling-stroke" opacity="0.65" />
+                  <path :d="group.area" fill="rgb(121 130 143 / 0.16)" />
+                  <path :d="group.line" fill="none" stroke="#79828f" stroke-width="1" vector-effect="non-scaling-stroke" />
+                  <line x1="0" x2="1000" :y1="group.xy" :y2="group.xy" stroke="#e8a33d" stroke-width="1" stroke-dasharray="5 4" vector-effect="non-scaling-stroke" opacity="0.65" />
                 </svg>
                 <div
-                  v-for="b in g.entries" :key="b.index"
+                  v-for="b in group.entries" :key="b.index"
                   class="blk"
                   :style="{
                     left: b.left, width: b.width,
@@ -310,24 +294,24 @@ function downloadAll() {
                 </div>
               </div>
               <div style="display:flex;align-items:center;justify-content:space-between;color:var(--dim);font-size:9.5px;font-family:var(--mono)">
-                <span v-for="(t, i) in g.ticks" :key="i">{{ t }}</span>
+                <span v-for="(t, i) in group.ticks" :key="i">{{ t }}</span>
               </div>
             </div>
 
             <div class="cards">
               <div
-                v-for="c in g.entries" :key="c.index"
+                v-for="c in group.entries" :key="c.index"
                 class="card" :class="{ on: c.index === selected }"
                 @click="selected = c.index"
               >
                 <div class="shot">
-                  <img :src="frameUrl(g.item, c.segment.start)" alt="" loading="lazy">
+                  <img :src="frameUrl(group.item, c.segment.start)" alt="" loading="lazy">
                   <span class="tc">{{ range(c.segment.start, c.segment.end) }}</span>
                   <span class="cnt">{{ c.segment.count }} 人</span>
                 </div>
                 <div style="display:flex;align-items:center;gap:4px">
                   <div v-for="f in c.segment.faces.slice(0, 5)" :key="f" class="face sm">
-                    <img :src="cropUrl(g.item, f)" alt="" loading="lazy">
+                    <img :src="cropUrl(group.item, f)" alt="" loading="lazy">
                   </div>
                   <span v-if="c.segment.faces.length > 5" style="margin-left:1px;color:var(--dim);font-size:10px;font-family:var(--mono)">
                     +{{ c.segment.faces.length - 5 }}
@@ -559,18 +543,6 @@ section {
   padding: 11px 13px; border-top: 1px solid var(--line);
 }
 
-.srclist { display: flex; flex-direction: column; gap: 1px; padding: 0 9px; overflow: auto; }
-.srcrow {
-  display: flex; align-items: center; gap: 8px; height: var(--h); padding: 0 8px;
-  border-radius: var(--r); cursor: pointer; transition: background 0.12s ease;
-}
-.srcrow:hover { background: var(--k3); }
-.srcrow.on { background: var(--k2); }
-.dot { width: 4px; height: 14px; flex: none; border-radius: 1px; }
-.srcrow .title {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-size: 12px;
-}
 .kv { display: flex; align-items: baseline; justify-content: space-between; }
 .kv > span:first-child { color: var(--mut); font-size: 11px; }
 .kv .num { color: var(--fg); font-size: 12px; }

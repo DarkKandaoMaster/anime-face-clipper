@@ -144,7 +144,7 @@ const stageRows = computed(() => {
 function pick(row: Row) {
   if (row.kind === 'upload') return w.dismissUpload(row.key)
   const asset = w.assets.value.find((a) => a.id === row.id)!
-  if (asset.status === 'done') return navigateTo(`/results/${asset.task_id}`)
+  if (asset.status === 'done') return navigateTo(`/results/${asset.task_id}?asset=${asset.id}`)
   if (['queued', 'running'].includes(asset.status) && asset.task_id) return w.cancel(asset.task_id)
   return w.remove(asset.id)
 }
